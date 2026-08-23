@@ -32,6 +32,9 @@ local function NAPC_Panel_1(panel)
 	panel:NumSlider(NAPC_Text["NAPC_OODA_Aggression"].OptionName, "NAPC_OODA_Aggression", 0.5, 2.0, 1)
 	panel:ControlHelp(NAPC_Text["NAPC_OODA_Aggression"].help_1)
 	panel:ControlHelp(NAPC_Text["NAPC_OODA_Aggression"].help_2)
+	panel:CheckBox(NAPC_Text["NAPC_Debug_AreaScores"].OptionName, "NAPC_Debug_AreaScores")
+	panel:ControlHelp(NAPC_Text["NAPC_Debug_AreaScores"].help_1)
+	panel:ControlHelp(NAPC_Text["NAPC_Debug_AreaScores"].help_2)
 	panel:Help([[ ]])
 	panel:CheckBox(NAPC_Text["NAPC_WorksOn_ANPlus"].OptionName, "NAPC_WorksOn_ANPlus")
 	panel:ControlHelp(NAPC_Text["NAPC_WorksOn_ANPlus"].help_1)
@@ -436,6 +439,11 @@ local function DrawNAPC_OverheadDebug()
 end
 
 local function DrawNAPC_AreaScoresDebug()
+	local cv = GetConVar("NAPC_Debug_AreaScores")
+	if not cv or not cv:GetBool() then
+		return
+	end
+
 	if not DebugPayload or not DebugPayload.areaScores or CurTime() - LastDebugReceived > 2.0 then
 		return
 	end
@@ -443,47 +451,49 @@ local function DrawNAPC_AreaScoresDebug()
 	local eyePos = LocalPlayer():EyePos()
 
 	for _, area in ipairs(DebugPayload.areaScores) do
-		local dist = eyePos:Distance(area.pos)
-		if dist <= 2200 then
-			local screen = (area.pos + Vector(0, 0, 32)):ToScreen()
-			if screen.visible then
-				local col = Color(120, 255, 120)
-				if area.danger >= 4 then
-					col = Color(255, 60, 60)
-				elseif area.danger >= 2 then
-					col = Color(255, 160, 40)
-				elseif area.danger >= 0.8 then
-					col = Color(255, 255, 100)
-				end
+		if area and area.pos and isvector(area.pos) then
+			local dist = eyePos:Distance(area.pos)
+			if dist <= 3000 then
+				local screen = (area.pos + Vector(0, 0, 16)):ToScreen()
+				if screen.visible then
+					local col = Color(120, 255, 120)
+					if area.danger >= 4 then
+						col = Color(255, 60, 60)
+					elseif area.danger >= 2 then
+						col = Color(255, 160, 40)
+					elseif area.danger >= 0.8 then
+						col = Color(255, 255, 100)
+					end
 
-				draw.SimpleText(
-					string.format(
-						"Area %d [%s] (Avoidance: %.1f)",
-						area.id,
-						area.faction or "combine",
-						area.danger or 0
-					),
-					"NAPC_Debug_Text",
-					screen.x,
-					screen.y - 12,
-					col,
-					TEXT_ALIGN_CENTER
-				)
-				draw.SimpleText(
-					string.format(
-						"Deaths: %.1f | Watchers: %.1f | Fire: %.1f | FlankPath: %.2f | Ridge: %.2f",
-						area.deaths or 0,
-						area.seen or 0,
-						area.fired or 0,
-						area.flank or 0,
-						area.overlook or 0
-					),
-					"NAPC_Debug_Small",
-					screen.x,
-					screen.y + 2,
-					Color(220, 220, 220),
-					TEXT_ALIGN_CENTER
-				)
+					draw.SimpleText(
+						string.format(
+							"NavArea %d [%s] (Avoidance: %.1f)",
+							area.id,
+							area.faction or "combine",
+							area.danger or 0
+						),
+						"NAPC_Debug_Text",
+						screen.x,
+						screen.y - 12,
+						col,
+						TEXT_ALIGN_CENTER
+					)
+					draw.SimpleText(
+						string.format(
+							"Deaths: %.1f | Watchers: %.1f | Fire: %.1f | Flank: %.2f | Ridge: %.2f",
+							area.deaths or 0,
+							area.seen or 0,
+							area.fired or 0,
+							area.flank or 0,
+							area.overlook or 0
+						),
+						"NAPC_Debug_Small",
+						screen.x,
+						screen.y + 2,
+						Color(220, 220, 220),
+						TEXT_ALIGN_CENTER
+					)
+				end
 			end
 		end
 	end
@@ -646,63 +656,127 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 
 		local pts = arc.path or {}
 		for i = 1, #pts - 1 do
-			render.DrawLine(pts[i], pts[i + 1], arcCol, false)
+			if pts[i] and pts[i + 1] then
+				render.DrawLine(pts[i], pts[i + 1], arcCol, false)
+			end
 		end
 
 		for _, bPos in ipairs(arc.bounces or {}) do
-			render.DrawWireframeSphere(bPos, 6, 6, 6, Color(255, 200, 0, 220), false)
+			if isvector(bPos) then
+				render.DrawWireframeSphere(bPos, 6, 6, 6, Color(255, 200, 0, 220), false)
+			end
 		end
 
-		if arc.finalPos then
+		if arc.finalPos and isvector(arc.finalPos) then
 			render.DrawWireframeSphere(arc.finalPos, 14, 8, 8, arcCol, false)
 			render.DrawWireframeSphere(arc.finalPos, 220, 16, 16, Color(arcCol.r, arcCol.g, arcCol.b, 60), false)
 		end
 	end
 
-	for _, area in ipairs(DebugPayload.areaScores or {}) do
-		local col = Color(100, 255, 100, 150)
-		if area.danger >= 4 then
-			col = Color(255, 50, 50, 220)
-		elseif area.danger >= 2 then
-			col = Color(255, 160, 40, 190)
-		elseif area.danger >= 0.8 then
-			col = Color(255, 255, 80, 170)
-		end
+	local showAreaScores = GetConVar("NAPC_Debug_AreaScores") and GetConVar("NAPC_Debug_AreaScores"):GetBool()
+	if showAreaScores then
+		for _, area in ipairs(DebugPayload.areaScores or {}) do
+			if area and area.pos and isvector(area.pos) then
+				local col = Color(100, 255, 100, 180)
+				if area.danger >= 4 then
+					col = Color(255, 50, 50, 220)
+				elseif area.danger >= 2 then
+					col = Color(255, 160, 40, 200)
+				elseif area.danger >= 0.8 then
+					col = Color(255, 255, 80, 180)
+				end
 
-		render.DrawWireframeBox(area.pos, Angle(0, 0, 0), Vector(-20, -20, 0), Vector(20, 20, 10), col, false)
-		render.DrawLine(area.pos, area.pos + Vector(0, 0, 28), col, false)
+				local corners = area.corners
+				if
+					corners
+					and #corners == 4
+					and isvector(corners[1])
+					and isvector(corners[2])
+					and isvector(corners[3])
+					and isvector(corners[4])
+				then
+					render.DrawLine(corners[1], corners[2], col, false)
+					render.DrawLine(corners[2], corners[3], col, false)
+					render.DrawLine(corners[3], corners[4], col, false)
+					render.DrawLine(corners[4], corners[1], col, false)
 
-		if (area.flank or 0) > 0.35 then
-			render.DrawWireframeSphere(area.pos + Vector(0, 0, 14), 12, 8, 8, Color(255, 180, 0, 180), false)
-		end
+					local innerCol = Color(col.r, col.g, col.b, math.floor(col.a * 0.35))
+					render.DrawLine(corners[1], corners[3], innerCol, false)
+					render.DrawLine(corners[2], corners[4], innerCol, false)
+				end
 
-		if (area.overlook or 0) > 0.35 then
-			render.DrawWireframeBox(
-				area.pos + Vector(0, 0, 18),
-				Angle(0, 0, 0),
-				Vector(-6, -6, 0),
-				Vector(6, 6, 18),
-				Color(0, 200, 255, 200),
-				false
-			)
+				if (area.flank or 0) > 0.35 then
+					render.DrawWireframeSphere(area.pos + Vector(0, 0, 14), 14, 8, 8, Color(255, 180, 0, 200), false)
+				end
+
+				if (area.overlook or 0) > 0.35 then
+					render.DrawWireframeBox(
+						area.pos + Vector(0, 0, 18),
+						Angle(0, 0, 0),
+						Vector(-8, -8, 0),
+						Vector(8, 8, 20),
+						Color(0, 200, 255, 220),
+						false
+					)
+				end
+			end
 		end
 	end
 
 	for _, z in ipairs(DebugPayload.dangerZones or {}) do
-		render.DrawWireframeSphere(z.pos, z.radius, 12, 12, Color(255, 40, 40, 100), false)
+		if z and z.pos and isvector(z.pos) then
+			render.DrawWireframeSphere(z.pos, z.radius or 120, 12, 12, Color(255, 40, 40, 100), false)
+		end
 	end
 
 	for _, npc in ipairs(DebugPayload.npcs or {}) do
-		if npc.forcedGo then
-			render.DrawLine(npc.pos + Vector(0, 0, 32), npc.forcedGo + Vector(0, 0, 32), Color(0, 255, 120, 220), false)
-			render.DrawWireframeBox(
-				npc.forcedGo,
-				Angle(0, 0, 0),
-				Vector(-8, -8, 0),
-				Vector(8, 8, 48),
-				Color(0, 255, 120, 200),
-				false
-			)
+		if npc and npc.pos and isvector(npc.pos) then
+			if npc.waypointPath and istable(npc.waypointPath) and #npc.waypointPath > 1 then
+				local wps = npc.waypointPath
+				local activeIdx = npc.waypointIndex or 1
+
+				if wps[activeIdx] and isvector(wps[activeIdx]) then
+					render.DrawLine(
+						npc.pos + Vector(0, 0, 36),
+						wps[activeIdx] + Vector(0, 0, 36),
+						Color(255, 200, 0, 240),
+						false
+					)
+				end
+
+				for i = 1, #wps do
+					local pt = wps[i]
+					if isvector(pt) then
+						local isCurrent = (i == activeIdx)
+						local nodeCol = isCurrent and Color(255, 80, 0, 255) or Color(255, 180, 0, 180)
+						render.DrawWireframeBox(pt, Angle(0, 0, 0), Vector(-6, -6, 0), Vector(6, 6, 24), nodeCol, false)
+
+						if i < #wps and isvector(wps[i + 1]) then
+							render.DrawLine(
+								pt + Vector(0, 0, 24),
+								wps[i + 1] + Vector(0, 0, 24),
+								Color(255, 150, 0, 220),
+								false
+							)
+						end
+					end
+				end
+			elseif npc.forcedGo and isvector(npc.forcedGo) then
+				render.DrawLine(
+					npc.pos + Vector(0, 0, 32),
+					npc.forcedGo + Vector(0, 0, 32),
+					Color(0, 255, 120, 220),
+					false
+				)
+				render.DrawWireframeBox(
+					npc.forcedGo,
+					Angle(0, 0, 0),
+					Vector(-8, -8, 0),
+					Vector(8, 8, 48),
+					Color(0, 255, 120, 200),
+					false
+				)
+			end
 		end
 	end
 end)

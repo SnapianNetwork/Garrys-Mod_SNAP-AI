@@ -278,5 +278,10 @@ NAPC_Localization_EN = {
 	["NAPC_Combine_MoreGrenades"] = {
 		OptionName = "Enable Combine Throw Grenades Frequently",
 		help_1 = "To make Combine soldiers throw frag grenades more frequently."
-	}
+	},
+    ["NAPC_Debug_AreaScores"] = {
+        OptionName = "Enable Nav Area Scoring Visuals",
+        help_1 = "Visualizes tactical navmesh area heatmaps, scoring metrics, and flank routes.",
+        help_2 = "Only renders in 3D/HUD when developer mode (developer > 0) is enabled."
+    }
 }
