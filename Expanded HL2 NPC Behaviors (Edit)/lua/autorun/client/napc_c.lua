@@ -301,6 +301,9 @@ local function DrawNAPC_OverheadDebug()
 				local hasTopScores = npc.ooda and npc.ooda.topScores and #npc.ooda.topScores > 0
 				local boxWidth = 230
 				local boxHeight = 110
+				if npc.priorityTargetIdx then
+					boxHeight = boxHeight + 14
+				end
 				if hasTopScores then
 					boxHeight = boxHeight + math.min(#npc.ooda.topScores, 3) * 12 + 8
 				end
@@ -403,11 +406,24 @@ local function DrawNAPC_OverheadDebug()
 				local enemyCol = npc.hasLOS and Color(255, 90, 90) or Color(150, 150, 150)
 				draw.SimpleText(enemyTxt, "NAPC_Debug_Small", drawX + 6, drawY + 74, enemyCol, TEXT_ALIGN_LEFT)
 
+				local currentY = drawY + 88
+				if npc.priorityTargetIdx then
+					draw.SimpleText(
+						string.format("★ FOCUS: [%d] (%s)", npc.priorityTargetIdx, npc.priorityReason or "PRIORITY"),
+						"NAPC_Debug_Small",
+						drawX + 6,
+						currentY,
+						Color(255, 215, 0),
+						TEXT_ALIGN_LEFT
+					)
+					currentY = currentY + 14
+				end
+
 				if hasTopScores then
 					surface.SetDrawColor(255, 255, 255, 30)
-					surface.DrawLine(drawX + 4, drawY + 88, drawX + boxWidth - 4, drawY + 88)
+					surface.DrawLine(drawX + 4, currentY, drawX + boxWidth - 4, currentY)
 
-					local scoreY = drawY + 92
+					local scoreY = currentY + 4
 					local count = math.min(#npc.ooda.topScores, 3)
 					for sIdx = 1, count do
 						local item = npc.ooda.topScores[sIdx]
@@ -504,7 +520,7 @@ local function DrawNAPC_HUDDashboard()
 		return
 	end
 
-	local panelW = 330
+	local panelW = 340
 	local panelX = ScrW() - panelW - 20
 	local panelY = 60
 	local headerH = 26
@@ -516,8 +532,12 @@ local function DrawNAPC_HUDDashboard()
 
 	local dangerCount = #(DebugPayload.dangerZones or {})
 	local areaCount = #(DebugPayload.areaScores or {})
+	local priorityCount = #(DebugPayload.priorityTargets or {})
 
-	local dynamicH = 85 + (squadCount * 36) + (dangerCount * 15)
+	local dynamicH = 85
+		+ (squadCount * 36)
+		+ (dangerCount * 15)
+		+ (priorityCount > 0 and (22 + (priorityCount * 15)) or 0)
 
 	surface.SetDrawColor(8, 12, 18, 230)
 	surface.DrawRect(panelX, panelY, panelW, dynamicH)
@@ -603,6 +623,42 @@ local function DrawNAPC_HUDDashboard()
 
 			draw.SimpleText(coveringTxt, "NAPC_Debug_Small", panelX + 18, curY, Color(150, 220, 150), TEXT_ALIGN_LEFT)
 			curY = curY + 18
+		end
+	end
+
+	if priorityCount > 0 then
+		surface.SetDrawColor(255, 255, 255, 40)
+		surface.DrawLine(panelX + 6, curY, panelX + panelW - 6, curY)
+		curY = curY + 6
+
+		draw.SimpleText(
+			"ACTIVE FOCUS FIRE TARGETS:",
+			"NAPC_Debug_Title",
+			panelX + 8,
+			curY,
+			Color(255, 215, 0),
+			TEXT_ALIGN_LEFT
+		)
+		curY = curY + 16
+
+		for _, pt in ipairs(DebugPayload.priorityTargets) do
+			draw.SimpleText(
+				string.format("[%d] %s (%d%% HP) - %s", pt.entIdx, pt.class, math.floor(pt.hpRatio * 100), pt.reason),
+				"NAPC_Debug_Small",
+				panelX + 12,
+				curY,
+				Color(255, 225, 120),
+				TEXT_ALIGN_LEFT
+			)
+			draw.SimpleText(
+				string.format("%d Focusers", pt.targetedBy),
+				"NAPC_Debug_Small",
+				panelX + panelW - 10,
+				curY,
+				Color(255, 180, 0),
+				TEXT_ALIGN_RIGHT
+			)
+			curY = curY + 14
 		end
 	end
 
@@ -729,8 +785,37 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 		end
 	end
 
+	for _, pt in ipairs(DebugPayload.priorityTargets or {}) do
+		if pt and pt.wsc and isvector(pt.wsc) then
+			local pulse = math.abs(math.sin(CurTime() * 3.5)) * 6
+			render.DrawWireframeSphere(pt.wsc, 18 + pulse, 10, 10, Color(255, 215, 0, 240), false)
+			render.DrawWireframeBox(
+				pt.wsc,
+				Angle(0, CurTime() * 45, 0),
+				Vector(-12, -12, -12),
+				Vector(12, 12, 12),
+				Color(255, 180, 0, 220),
+				false
+			)
+		end
+	end
+
 	for _, npc in ipairs(DebugPayload.npcs or {}) do
 		if npc and npc.pos and isvector(npc.pos) then
+			if npc.priorityTargetIdx then
+				for _, pt in ipairs(DebugPayload.priorityTargets or {}) do
+					if pt.entIdx == npc.priorityTargetIdx and pt.wsc then
+						render.DrawLine(
+							npc.eyePos or (npc.pos + Vector(0, 0, 48)),
+							pt.wsc,
+							Color(255, 215, 0, 160),
+							false
+						)
+						break
+					end
+				end
+			end
+
 			if npc.waypointPath and istable(npc.waypointPath) and #npc.waypointPath > 1 then
 				local wps = npc.waypointPath
 				local activeIdx = npc.waypointIndex or 1

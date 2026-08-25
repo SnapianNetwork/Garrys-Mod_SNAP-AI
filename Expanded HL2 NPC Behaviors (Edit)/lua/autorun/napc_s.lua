@@ -383,7 +383,7 @@ NAPC.StepOffsets = {
 
 NAPC.AreaScoreRecords = {}
 NAPC.AreaScore_Count = 0
-NAPC.AreaScore_MaxRecords = 512
+NAPC.AreaScore_MaxRecords = 1024
 NAPC.AreaScore_TrackTime = 35
 NAPC.AreaScore_VisionInterval = 1.8
 NAPC.AreaScore_VisionRangeSqr = 3500 * 3500
@@ -691,6 +691,9 @@ function NAPC.IsPositionInWater(pos)
 	return false
 end
 
+local navVisitedSession = 0
+local navVisited = {}
+
 function NAPC.NavMeshPathExists(startPos, targetPos, maxSteps)
 	if not (navmesh and navmesh.IsLoaded and navmesh.IsLoaded()) then
 		return true
@@ -715,9 +718,11 @@ function NAPC.NavMeshPathExists(startPos, targetPos, maxSteps)
 		return false
 	end
 
-	maxSteps = maxSteps or 80
+	maxSteps = maxSteps or 40
+	navVisitedSession = navVisitedSession + 1
+	local curSession = navVisitedSession
 	local openQueue = { startArea }
-	local visited = { [startArea:GetID()] = true }
+	navVisited[startArea:GetID()] = curSession
 	local targetID = targetArea:GetID()
 	local maxStepUp = 32
 	local maxDrop = 240
@@ -741,7 +746,7 @@ function NAPC.NavMeshPathExists(startPos, targetPos, maxSteps)
 					end
 
 					if
-						not visited[nID]
+						navVisited[nID] ~= curSession
 						and not neighbor:IsUnderwater()
 						and bit.band(neighbor:GetAttributes(), NAV_MESH_WATER or 32) == 0
 					then
@@ -749,7 +754,7 @@ function NAPC.NavMeshPathExists(startPos, targetPos, maxSteps)
 							local nCenter = neighbor:GetCenter()
 							local zDelta = nCenter.z - curCenter.z
 							if zDelta <= maxStepUp and zDelta >= -maxDrop then
-								visited[nID] = true
+								navVisited[nID] = curSession
 								openQueue[#openQueue + 1] = neighbor
 							end
 						end
@@ -1315,12 +1320,33 @@ function NAPC.AreaDangerScore(rec, faction, now, enemy)
 end
 
 function NAPC.AreaGetDangerAtPos(pos, faction, now, enemy)
-	if not isvector(pos) then
+	if not isvector(pos) or NAPC.AreaScore_Count == 0 then
 		return 0
 	end
 	now = now or CurTime()
-	local worstAvoidance = 0
 
+	if navmesh and navmesh.IsLoaded and navmesh.IsLoaded() then
+		local area = navmesh.GetNearestNavArea(pos, false, NAPC.AreaScore_InfluenceRadius, false, true)
+		if IsValid(area) then
+			local rec = NAPC.AreaScoreRecords[area:GetID()]
+			local worst = rec and NAPC.AreaDangerScore(rec, faction, now, enemy) or 0
+			local adjs = area:GetAdjacentAreas()
+			if istable(adjs) then
+				for i = 1, #adjs do
+					local adjRec = NAPC.AreaScoreRecords[adjs[i]:GetID()]
+					if adjRec then
+						local s = NAPC.AreaDangerScore(adjRec, faction, now, enemy) * 0.7
+						if s > worst then
+							worst = s
+						end
+					end
+				end
+			end
+			return worst
+		end
+	end
+
+	local worstAvoidance = 0
 	for _, rec in pairs(NAPC.AreaScoreRecords) do
 		local dSqr = rec.pos:DistToSqr(pos)
 		if dSqr <= NAPC.AreaScore_InfluenceRadiusSqr then
@@ -1446,6 +1472,45 @@ function NAPC.IsDestinationValid(npc, targetPos, allowDirectBlocked)
 	return true
 end
 
+local SAMPLE_ANGLES_COVER = { -45, 45, -90, 90, 140, -140, 180 }
+local SAMPLE_DISTS_COVER = { 280, 480, 750 }
+local SAMPLE_ANGLES_FLANK = { 55, 85, 115 }
+local SAMPLE_DISTS_FLANK = { 550, 850 }
+local SAMPLE_STEP_OFFSETS = { Vector(-40, 0, 0), Vector(40, 0, 0), Vector(0, -36, 0) }
+
+local CARDINAL_DIRS_4 = {
+	Vector(1, 0, 0),
+	Vector(-1, 0, 0),
+	Vector(0, 1, 0),
+	Vector(0, -1, 0),
+}
+
+function NAPC.IsPositionInFatalFunnel(pos)
+	if not pos then
+		return false
+	end
+
+	local checkCenter = pos + Vector(0, 0, 36)
+	local lateralEnclosure = 0
+
+	for i = 1, 4 do
+		NAPC.trData.start = checkCenter
+		NAPC.trData.endpos = checkCenter + (CARDINAL_DIRS_4[i] * 320)
+		NAPC.trData.mask = MASK_SOLID_BRUSHONLY
+		NAPC.trData.filter = nil
+		util.TraceLine(NAPC.trData)
+
+		if NAPC.trRes.Hit and not NAPC.trRes.StartSolid and math.abs(NAPC.trRes.HitNormal.z) < 0.35 then
+			lateralEnclosure = lateralEnclosure + 1
+			if lateralEnclosure >= 2 then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
 function NAPC.FindFlankPos(npc, enemy, allThreats)
 	if not IsValid(npc) or not IsValid(enemy) then
 		return nil
@@ -1455,10 +1520,10 @@ function NAPC.FindFlankPos(npc, enemy, allThreats)
 	local npcPos = npc:GetPos()
 	local enemyPos = enemy:GetPos()
 
-	if npc.CachedFlankTime_NAPC and (cur - npc.CachedFlankTime_NAPC < 1.5) and npc.CachedFlankPos_NAPC then
+	if npc.CachedFlankTime_NAPC and (cur - npc.CachedFlankTime_NAPC < 1.6) then
 		if
 			npc.CachedFlankEnemy_NAPC == enemy
-			and (npcPos - (npc.CachedFlankOrigin_NAPC or npcPos)):LengthSqr() < 22500
+			and (npcPos - (npc.CachedFlankOrigin_NAPC or npcPos)):LengthSqr() < 25600
 		then
 			return npc.CachedFlankPos_NAPC
 		end
@@ -1468,64 +1533,45 @@ function NAPC.FindFlankPos(npc, enemy, allThreats)
 	local enemyEye = enemy:EyePos()
 	local toEnemy = (enemyPos - npcPos):GetNormalized()
 	local flankSide = (ooda and ooda.FlankSide) or 1
+	local enemyAim = enemy:GetAimVector()
+	local myFaction = NAPC.AreaGetFactionOf(npc)
 
 	local bestPos = nil
 	local bestScore = -99999
 
-	local sampleAngles = { 55 * flankSide, 80 * flankSide, 105 * flankSide, 130 * flankSide }
-	local sampleDists = { 500, 750, 1000 }
-
-	for _, dist in ipairs(sampleDists) do
-		for _, ang in ipairs(sampleAngles) do
-			local dir = (toEnemy:Angle() + Angle(0, ang, 0)):Forward()
+	for _, dist in ipairs(SAMPLE_DISTS_FLANK) do
+		for _, ang in ipairs(SAMPLE_ANGLES_FLANK) do
+			local dir = (toEnemy:Angle() + Angle(0, ang * flankSide, 0)):Forward()
 			local candidatePos = enemyPos + (dir * dist)
-			local dToNPC = (candidatePos - npcPos):Length()
 			local dToEnemy = (candidatePos - enemyPos):Length()
 
 			if dToEnemy >= 450 and NAPC.IsDestinationValid(npc, candidatePos, false) then
 				NAPC.trData.start = candidatePos + Vector(0, 0, 96)
-				NAPC.trData.endpos = candidatePos - Vector(0, 0, 256)
+				NAPC.trData.endpos = candidatePos - Vector(0, 0, 200)
 				NAPC.trData.mask = MASK_SOLID_BRUSHONLY
 				NAPC.trData.filter = nil
 				util.TraceLine(NAPC.trData)
 
 				if NAPC.trRes.Hit and not NAPC.trRes.StartSolid and NAPC.trRes.HitNormal.z > 0.65 then
 					local groundPos = NAPC.trRes.HitPos
-					if not NAPC.IsPositionInWater(groundPos) and not NAPC.IsPositionInFatalFunnel(groundPos) then
+					if not NAPC.IsPositionInWater(groundPos) then
 						local standEye = groundPos + Vector(0, 0, 64)
-						local crouchEye = groundPos + Vector(0, 0, 36)
 
 						NAPC.trData.start = standEye
 						NAPC.trData.endpos = enemyEye
 						NAPC.trData.filter = { npc, enemy }
 						NAPC.trData.mask = MASK_SHOT
 						util.TraceLine(NAPC.trData)
-						local hasLOS = (NAPC.trRes.Fraction >= 0.88 or NAPC.trRes.Entity == enemy)
 
-						NAPC.trData.start = crouchEye
-						NAPC.trData.endpos = enemyEye
-						NAPC.trData.filter = { npc, enemy }
-						NAPC.trData.mask = MASK_SHOT
-						util.TraceLine(NAPC.trData)
-						local crouchCover = (NAPC.trRes.Fraction < 1.0 and NAPC.trRes.Entity ~= enemy)
-
-						local concealedSteps = 0
-						local testOffsets = { Vector(-40, 0, 0), Vector(40, 0, 0), Vector(0, -40, 0), Vector(0, 40, 0) }
-
-						for _, stepVec in ipairs(testOffsets) do
-							local stepEye = standEye + stepVec
-							NAPC.trData.start = stepEye
+						if NAPC.trRes.Fraction >= 0.88 or NAPC.trRes.Entity == enemy then
+							local crouchEye = groundPos + Vector(0, 0, 36)
+							NAPC.trData.start = crouchEye
 							NAPC.trData.endpos = enemyEye
 							NAPC.trData.filter = { npc, enemy }
 							NAPC.trData.mask = MASK_SHOT
 							util.TraceLine(NAPC.trData)
+							local crouchCover = (NAPC.trRes.Fraction < 1.0 and NAPC.trRes.Entity ~= enemy)
 
-							if NAPC.trRes.Fraction < 1.0 and NAPC.trRes.Entity ~= enemy then
-								concealedSteps = concealedSteps + 1
-							end
-						end
-
-						if crouchCover or concealedSteps > 0 then
 							NAPC.hullTrData.start = groundPos + Vector(0, 0, 5)
 							NAPC.hullTrData.endpos = groundPos + Vector(0, 0, 60)
 							NAPC.hullTrData.filter = nil
@@ -1533,16 +1579,14 @@ function NAPC.FindFlankPos(npc, enemy, allThreats)
 
 							if not NAPC.hullTrRes.Hit then
 								local toCand = (standEye - enemyEye):GetNormalized()
-								local angleDisparity = enemy:GetAimVector():Dot(toCand)
+								local angleDisparity = enemyAim:Dot(toCand)
 								local blindAngleBonus = (1.0 - angleDisparity) * 60
-								local avoidancePenalty =
-									NAPC.AreaGetDangerAtPos(groundPos, NAPC.AreaGetFactionOf(npc), cur, enemy)
+								local avoidancePenalty = NAPC.AreaGetDangerAtPos(groundPos, myFaction, cur, enemy)
 
-								local score = (crouchCover and 60 or 0)
-									+ (concealedSteps * 35)
+								local score = (crouchCover and 60 or 25)
 									+ blindAngleBonus
-									+ (hasLOS and 45 or -25)
-									- (dToNPC * 0.035)
+									+ 45
+									- ((candidatePos - npcPos):Length() * 0.03)
 									- (avoidancePenalty * 20)
 
 								if score > bestScore then
@@ -1557,12 +1601,10 @@ function NAPC.FindFlankPos(npc, enemy, allThreats)
 		end
 	end
 
-	if bestPos then
-		npc.CachedFlankTime_NAPC = cur
-		npc.CachedFlankPos_NAPC = bestPos
-		npc.CachedFlankEnemy_NAPC = enemy
-		npc.CachedFlankOrigin_NAPC = npcPos
-	end
+	npc.CachedFlankTime_NAPC = cur
+	npc.CachedFlankPos_NAPC = bestPos
+	npc.CachedFlankEnemy_NAPC = enemy
+	npc.CachedFlankOrigin_NAPC = npcPos
 
 	return bestPos
 end
@@ -1679,58 +1721,85 @@ function NAPC.AreaRegisterCombatAreas(now)
 	if (NAPC.NextAreaRegBatch or 0) > now then
 		return
 	end
-	NAPC.NextAreaRegBatch = now + 1.2
+	NAPC.NextAreaRegBatch = now + 2.0
+
+	local activeNPCs = {}
+	for npc, _ in pairs(NAPC.CurNPCList) do
+		if IsValid(npc) and npc:IsNPC() and npc:Alive() then
+			local state = npc:GetNPCState()
+			if state == NPC_STATE_COMBAT or state == NPC_STATE_ALERT then
+				activeNPCs[#activeNPCs + 1] = npc
+			end
+		end
+	end
+
+	local npcCount = #activeNPCs
+	if npcCount == 0 then
+		return
+	end
+
+	local baseSideRadius = 1200
+	local scaledSideRadius = math.min(2000, baseSideRadius + (npcCount * 60))
+	local inBetweenRadius = math.Clamp(scaledSideRadius * 0.6, 600, 1200)
+	local maxBatchRegister = math.Clamp(24 + (npcCount * 4), 24, 96)
 
 	local registered = 0
-	local maxBatchRegister = 32
-	local combatSearchDist = 4500
 	local processedCentroids = {}
 
-	for npc, _ in pairs(NAPC.CurNPCList) do
+	local function RegisterCentroid(pos, searchRadius)
+		if registered >= maxBatchRegister or not isvector(pos) then
+			return
+		end
+
+		local minDistSqr = (searchRadius * 0.7) * (searchRadius * 0.7)
+		for i = 1, #processedCentroids do
+			if (pos - processedCentroids[i]):LengthSqr() < minDistSqr then
+				return
+			end
+		end
+
+		processedCentroids[#processedCentroids + 1] = pos
+		local areas = navmesh.Find(pos, searchRadius, 100, 160)
+
+		if istable(areas) then
+			for i = 1, #areas do
+				if registered >= maxBatchRegister then
+					break
+				end
+				local area = areas[i]
+				if IsValid(area) and not area:IsUnderwater() then
+					local rec = NAPC.AreaGetRecord(area)
+					if rec then
+						NAPC.AreaTouch(rec, now)
+						registered = registered + 1
+					end
+				end
+			end
+		end
+	end
+
+	for _, npc in ipairs(activeNPCs) do
 		if registered >= maxBatchRegister then
 			break
 		end
 
-		if IsValid(npc) and npc:IsNPC() and npc:Alive() then
-			local origin = nil
-			local enemy = npc.GetEnemy and npc:GetEnemy() or nil
+		local npcPos = npc:GetPos()
+		local enemy = (npc.GetEnemy and npc:GetEnemy()) or nil
+		local hasEnemy = IsValid(enemy) and enemy:Alive() and not (enemy:IsPlayer() and NAPC.PlayerVisionIgnored(enemy))
 
-			if IsValid(enemy) and not (enemy:IsPlayer() and NAPC.PlayerVisionIgnored(enemy)) then
-				origin = enemy:GetPos()
-			elseif npc:GetNPCState() == NPC_STATE_COMBAT or npc:GetNPCState() == NPC_STATE_ALERT then
-				origin = npc:GetPos()
+		if hasEnemy then
+			local enemyPos = enemy:GetPos()
+			local dist = (enemyPos - npcPos):Length()
+
+			RegisterCentroid(npcPos, scaledSideRadius)
+			RegisterCentroid(enemyPos, scaledSideRadius)
+
+			if dist > 500 then
+				local midPos = LerpVector(0.5, npcPos, enemyPos)
+				RegisterCentroid(midPos, inBetweenRadius)
 			end
-
-			if origin then
-				local alreadyCovered = false
-				for _, prevPos in ipairs(processedCentroids) do
-					if (origin - prevPos):LengthSqr() < 360000 then
-						alreadyCovered = true
-						break
-					end
-				end
-
-				if not alreadyCovered then
-					processedCentroids[#processedCentroids + 1] = origin
-					local areas = navmesh.Find(origin, combatSearchDist, 120, 200)
-
-					if istable(areas) then
-						for i = 1, #areas do
-							if registered >= maxBatchRegister then
-								break
-							end
-							local area = areas[i]
-							if IsValid(area) and not area:IsUnderwater() then
-								local rec = NAPC.AreaGetRecord(area)
-								if rec then
-									NAPC.AreaTouch(rec, now)
-									registered = registered + 1
-								end
-							end
-						end
-					end
-				end
-			end
+		else
+			RegisterCentroid(npcPos, scaledSideRadius)
 		end
 	end
 end
@@ -1803,27 +1872,27 @@ function NAPC.AreaUpdateSquadRoles(now)
 			local enemyPos = enemy:GetPos()
 			local faction = NAPC.AreaGetFactionOf(members[1])
 			local flankCandidates = {}
-			local bestOverwatch, bestOWScore = nil, 0.4
+			local overwatchCandidates = {}
 
 			for _, rec in pairs(NAPC.AreaScoreRecords) do
 				if now <= rec.trackedUntil then
-					local areaPos = NAPC.GetAreaTacticalPos(rec.area, members[1]:GetPos(), enemyPos) or rec.pos
+					local areaPos = rec.pos
 					local d = areaPos:Distance(enemyPos)
-					if d >= 200 and d <= 5500 then
+					if d >= 250 and d <= 3500 then
 						local danger = NAPC.AreaDangerScore(rec, faction, now, enemy)
 						local flank = NAPC.AreaScoreFlankPos(areaPos, enemy)
 						local fScore = (flank * 3.5) - (danger * 1.2) - (math.abs(d - 800) * 0.0005)
 
-						if fScore > 0.25 and NAPC.IsDestinationValid(members[1], areaPos, false) then
-							flankCandidates[#flankCandidates + 1] = { pos = areaPos, score = fScore }
+						if fScore > 0.4 then
+							flankCandidates[#flankCandidates + 1] = { area = rec.area, pos = areaPos, score = fScore }
 						end
 
 						if (areaPos.z - enemyPos.z) >= 48 then
 							local ow = NAPC.AreaScoreOverlookPos(areaPos, enemy, rec)
 							local owScore = (ow * 3.2) - (danger * 1.4)
-							if owScore > bestOWScore and NAPC.IsDestinationValid(members[1], areaPos, false) then
-								bestOWScore = owScore
-								bestOverwatch = areaPos
+							if owScore > 0.45 then
+								overwatchCandidates[#overwatchCandidates + 1] =
+									{ area = rec.area, pos = areaPos, score = owScore }
 							end
 						end
 					end
@@ -1833,7 +1902,29 @@ function NAPC.AreaUpdateSquadRoles(now)
 			table.sort(flankCandidates, function(a, b)
 				return a.score > b.score
 			end)
-			local bestFlank = flankCandidates[1] and flankCandidates[1].pos or nil
+			table.sort(overwatchCandidates, function(a, b)
+				return a.score > b.score
+			end)
+
+			local bestFlank = nil
+			for i = 1, math.min(#flankCandidates, 4) do
+				local cand = flankCandidates[i]
+				local tacticalPos = NAPC.GetAreaTacticalPos(cand.area, members[1]:GetPos(), enemyPos) or cand.pos
+				if NAPC.IsDestinationValid(members[1], tacticalPos, false) then
+					bestFlank = tacticalPos
+					break
+				end
+			end
+
+			local bestOverwatch = nil
+			for i = 1, math.min(#overwatchCandidates, 4) do
+				local cand = overwatchCandidates[i]
+				local tacticalPos = NAPC.GetAreaTacticalPos(cand.area, members[1]:GetPos(), enemyPos) or cand.pos
+				if NAPC.IsDestinationValid(members[1], tacticalPos, false) then
+					bestOverwatch = tacticalPos
+					break
+				end
+			end
 
 			for i, m in ipairs(members) do
 				local role = "SUPPRESS"
@@ -1900,27 +1991,6 @@ function NAPC.AreaInfluenceOODA(npc, now)
 			NAPC.AreaBumpTactical(ooda, "FLANK_MANEUVER", 0.3)
 		end
 	end
-end
-
-function NAPC.AreaScoreCandidate(npc, pos, baseScore, enemy, purpose)
-	local faction = NAPC.AreaGetFactionOf(npc)
-	local now = CurTime()
-	local avoidancePenalty = NAPC.AreaGetDangerAtPos(pos, faction, now, enemy)
-	local score = baseScore - (avoidancePenalty * 25)
-
-	if IsValid(enemy) and not (enemy:IsPlayer() and NAPC.PlayerVisionIgnored(enemy)) then
-		if purpose == "flank" then
-			score = score + (NAPC.AreaScoreFlankPos(pos, enemy) * 30)
-		elseif purpose == "highground" then
-			score = score + (NAPC.AreaScoreOverlookPos(pos, enemy) * 35)
-		end
-	end
-
-	if purpose == "cover" then
-		score = score - (avoidancePenalty * 20)
-	end
-
-	return score
 end
 
 function NAPC.AreaDebugNearestFaction(pos)
@@ -2009,75 +2079,6 @@ function NAPC.AreaDebugRender(now)
 	end
 end
 
-function NAPC.FindWaterEscapePos(npc)
-	if not IsValid(npc) then
-		return nil
-	end
-	local npcPos = npc:GetPos()
-
-	if navmesh and navmesh.IsLoaded() and isfunction(navmesh.Find) then
-		local areas = navmesh.Find(npcPos, 900, 32, 128)
-		local bestAreaPos = nil
-		local bestDist = math.huge
-
-		if istable(areas) then
-			for _, area in ipairs(areas) do
-				if
-					IsValid(area)
-					and not area:IsUnderwater()
-					and bit.band(area:GetAttributes(), NAV_MESH_WATER or 32) == 0
-				then
-					local pos = NAPC.GetAreaTacticalPos(area, npcPos)
-					if not NAPC.IsPositionInWater(pos) and not NAPC.IsPosNearLethalDanger(pos, 48) then
-						local d = (pos - npcPos):LengthSqr()
-						if d < bestDist then
-							bestDist = d
-							bestAreaPos = pos
-						end
-					end
-				end
-			end
-		end
-		if bestAreaPos then
-			return bestAreaPos
-		end
-	end
-
-	local sampleAngles = { 0, 45, -45, 90, -90, 135, -135, 180 }
-	local sampleDists = { 220, 380, 560, 780 }
-
-	for _, dist in ipairs(sampleDists) do
-		for _, ang in ipairs(sampleAngles) do
-			local dir = (Angle(0, ang, 0) + npc:GetAngles()):Forward()
-			local candidate = npcPos + (dir * dist)
-
-			if not NAPC.IsPosNearLethalDanger(candidate, 48) and not NAPC.IsPositionInWater(candidate) then
-				NAPC.trData.start = candidate + Vector(0, 0, 128)
-				NAPC.trData.endpos = candidate - Vector(0, 0, 256)
-				NAPC.trData.mask = MASK_SOLID_BRUSHONLY
-				NAPC.trData.filter = nil
-				util.TraceLine(NAPC.trData)
-
-				if NAPC.trRes.Hit and not NAPC.trRes.StartSolid and NAPC.trRes.HitNormal.z > 0.65 then
-					local groundPos = NAPC.trRes.HitPos
-					if not NAPC.IsPositionInWater(groundPos) then
-						NAPC.hullTrData.start = groundPos + Vector(0, 0, 5)
-						NAPC.hullTrData.endpos = groundPos + Vector(0, 0, 60)
-						NAPC.hullTrData.filter = nil
-						util.TraceHull(NAPC.hullTrData)
-
-						if not NAPC.hullTrRes.Hit then
-							return groundPos
-						end
-					end
-				end
-			end
-		end
-	end
-
-	return nil
-end
-
 function NAPC.FindCounterHighGroundPos(npc, enemy, allThreats)
 	if not IsValid(npc) or not IsValid(enemy) then
 		return nil
@@ -2087,11 +2088,7 @@ function NAPC.FindCounterHighGroundPos(npc, enemy, allThreats)
 	local npcPos = npc:GetPos()
 	local enemyPos = enemy:GetPos()
 
-	if
-		npc.CachedHighGroundTime_NAPC
-		and (cur - npc.CachedHighGroundTime_NAPC < 1.5)
-		and npc.CachedHighGroundPos_NAPC
-	then
+	if npc.CachedHighGroundTime_NAPC and (cur - npc.CachedHighGroundTime_NAPC < 1.5) then
 		if
 			npc.CachedHighGroundEnemy_NAPC == enemy
 			and (npcPos - (npc.CachedHighGroundOrigin_NAPC or npcPos)):LengthSqr() < 22500
@@ -2180,19 +2177,12 @@ function NAPC.FindCounterHighGroundPos(npc, enemy, allThreats)
 		end
 	end
 
-	if bestPos then
-		npc.CachedHighGroundTime_NAPC = cur
-		npc.CachedHighGroundPos_NAPC = bestPos
-		npc.CachedHighGroundEnemy_NAPC = enemy
-		npc.CachedHighGroundOrigin_NAPC = npcPos
-	end
+	npc.CachedHighGroundTime_NAPC = cur
+	npc.CachedHighGroundPos_NAPC = bestPos
+	npc.CachedHighGroundEnemy_NAPC = enemy
+	npc.CachedHighGroundOrigin_NAPC = npcPos
 
 	return bestPos
-end
-
-function NAPC.FindHighGroundPos(npc, enemy, allThreats, minElevation)
-	minElevation = minElevation or 48
-	return NAPC.FindCounterHighGroundPos(npc, enemy, allThreats)
 end
 
 function NAPC.FindLureRetreatPos(npc, enemy, allThreats)
@@ -2200,8 +2190,19 @@ function NAPC.FindLureRetreatPos(npc, enemy, allThreats)
 		return nil
 	end
 
+	local cur = NAPC.CurTime_Tick
 	local npcPos = npc:GetPos()
 	local enemyPos = enemy:GetPos()
+
+	if npc.CachedLureTime_NAPC and (cur - npc.CachedLureTime_NAPC < 1.5) then
+		if
+			npc.CachedLureEnemy_NAPC == enemy
+			and (npcPos - (npc.CachedLureOrigin_NAPC or npcPos)):LengthSqr() < 22500
+		then
+			return npc.CachedLurePos_NAPC
+		end
+	end
+
 	local enemyEye = enemy:EyePos()
 	local awayFromEnemy = (npcPos - enemyPos):GetNormalized()
 	awayFromEnemy.z = 0
@@ -2211,8 +2212,8 @@ function NAPC.FindLureRetreatPos(npc, enemy, allThreats)
 	local bestPos = nil
 	local bestScore = -99999
 
-	local sampleAngles = { -70, -45, -20, 0, 20, 45, 70 }
-	local sampleDists = { 400, 650, 900, 1200 }
+	local sampleAngles = { -45, 0, 45, -70, 70 }
+	local sampleDists = { 400, 650, 900 }
 
 	for _, dist in ipairs(sampleDists) do
 		for _, ang in ipairs(sampleAngles) do
@@ -2261,6 +2262,11 @@ function NAPC.FindLureRetreatPos(npc, enemy, allThreats)
 		end
 	end
 
+	npc.CachedLureTime_NAPC = cur
+	npc.CachedLurePos_NAPC = bestPos
+	npc.CachedLureEnemy_NAPC = enemy
+	npc.CachedLureOrigin_NAPC = npcPos
+
 	return bestPos
 end
 
@@ -2307,7 +2313,7 @@ function NAPC.FindShelterCoverPos(npc, enemy, allThreats)
 	local cur = NAPC.CurTime_Tick
 	local npcPos = npc:GetPos()
 
-	if npc.CachedShelterTime_NAPC and (cur - npc.CachedShelterTime_NAPC < 1.5) and npc.CachedShelterPos_NAPC then
+	if npc.CachedShelterTime_NAPC and (cur - npc.CachedShelterTime_NAPC < 1.5) then
 		if (npcPos - (npc.CachedShelterOrigin_NAPC or npcPos)):LengthSqr() < 22500 then
 			return npc.CachedShelterPos_NAPC
 		end
@@ -2378,11 +2384,9 @@ function NAPC.FindShelterCoverPos(npc, enemy, allThreats)
 		end
 	end
 
-	if bestPos then
-		npc.CachedShelterTime_NAPC = cur
-		npc.CachedShelterPos_NAPC = bestPos
-		npc.CachedShelterOrigin_NAPC = npcPos
-	end
+	npc.CachedShelterTime_NAPC = cur
+	npc.CachedShelterPos_NAPC = bestPos
+	npc.CachedShelterOrigin_NAPC = npcPos
 
 	return bestPos
 end
@@ -2392,15 +2396,22 @@ function NAPC.FindKeyTacticalArea(npc, enemy, groupCenter)
 		return nil
 	end
 
+	local cur = NAPC.CurTime_Tick
 	local npcPos = npc:GetPos()
+
+	if npc.CachedKeyAreaTime_NAPC and (cur - npc.CachedKeyAreaTime_NAPC < 1.8) then
+		if (npcPos - (npc.CachedKeyAreaOrigin_NAPC or npcPos)):LengthSqr() < 25600 then
+			return npc.CachedKeyAreaPos_NAPC
+		end
+	end
+
 	local enemyPos = enemy:GetPos()
 	local enemyEye = enemy:EyePos()
 	local center = isvector(groupCenter) and groupCenter or npcPos
 	local myFaction = NAPC.AreaGetFactionOf(npc)
-	local cur = NAPC.CurTime_Tick
 
+	local bestAreaPos = nil
 	if navmesh and navmesh.IsLoaded and navmesh.IsLoaded() then
-		local bestAreaPos = nil
 		local bestScore = -math.huge
 
 		for _, rec in pairs(NAPC.AreaScoreRecords) do
@@ -2422,86 +2433,13 @@ function NAPC.FindKeyTacticalArea(npc, enemy, groupCenter)
 				end
 			end
 		end
-
-		if bestAreaPos then
-			return bestAreaPos
-		end
 	end
 
-	local toEnemy = (enemyPos - center):GetNormalized()
-	local rightVec = toEnemy:Angle():Right()
-	local sampleVectors = {
-		center + (rightVec * 450) + (toEnemy * 250),
-		center - (rightVec * 450) + (toEnemy * 250),
-		center + (rightVec * 600),
-		center - (rightVec * 600),
-	}
+	npc.CachedKeyAreaTime_NAPC = cur
+	npc.CachedKeyAreaPos_NAPC = bestAreaPos
+	npc.CachedKeyAreaOrigin_NAPC = npcPos
 
-	local bestPos = nil
-	local bestPosScore = -math.huge
-
-	for _, candPos in ipairs(sampleVectors) do
-		if NAPC.IsDestinationValid(npc, candPos, false) then
-			NAPC.trData.start = candPos + Vector(0, 0, 80)
-			NAPC.trData.endpos = candPos - Vector(0, 0, 180)
-			NAPC.trData.mask = MASK_SOLID_BRUSHONLY
-			NAPC.trData.filter = nil
-			util.TraceLine(NAPC.trData)
-
-			if NAPC.trRes.Hit and not NAPC.trRes.StartSolid and NAPC.trRes.HitNormal.z > 0.65 then
-				local groundPos = NAPC.trRes.HitPos
-				local standEye = groundPos + Vector(0, 0, 64)
-
-				NAPC.trData.start = standEye
-				NAPC.trData.endpos = enemyEye
-				NAPC.trData.filter = { npc, enemy }
-				NAPC.trData.mask = MASK_SHOT
-				util.TraceLine(NAPC.trData)
-
-				if NAPC.trRes.Fraction >= 0.88 or NAPC.trRes.Entity == enemy then
-					local elevationBonus = math.Clamp(groundPos.z - enemyPos.z, -20, 100) * 0.6
-					local score = 50 + elevationBonus - ((groundPos - npcPos):Length() * 0.03)
-
-					if score > bestPosScore then
-						bestPosScore = score
-						bestPos = groundPos
-					end
-				end
-			end
-		end
-	end
-
-	return bestPos
-end
-
-function NAPC.CreateScannerLight(scanner)
-	if not IsValid(scanner) or IsValid(scanner.Spotlight_NAPC) then
-		return
-	end
-
-	local att = scanner:LookupAttachment("light")
-	if not att or att <= 0 then
-		att = scanner:LookupAttachment("eye")
-	end
-
-	local light = ents.Create("env_projectedtexture")
-	if IsValid(light) then
-		light:SetPos(scanner:GetPos())
-		light:SetAngles(scanner:GetAngles())
-		light:SetParent(scanner)
-		if att and att > 0 then
-			light:Fire("SetParentAttachment", att == scanner:LookupAttachment("light") and "light" or "eye")
-		end
-		light:SetKeyValue("enableshadows", "1")
-		light:SetKeyValue("lightfov", "70")
-		light:SetKeyValue("farz", "850")
-		light:SetKeyValue("nearz", "12")
-		light:SetKeyValue("lightcolor", "220 235 255 255")
-		light:Spawn()
-		light:Input("SpotlightLength", nil, nil, 600)
-		scanner.Spotlight_NAPC = light
-		scanner:DeleteOnRemove(light)
-	end
+	return bestAreaPos
 end
 
 function NAPC.IsZombieOrHeadcrab(ent)
@@ -2520,11 +2458,22 @@ function NAPC.FindKiteRetreatPos(npc, enemy, allThreats, minRange, maxRange)
 		return nil
 	end
 
+	local cur = NAPC.CurTime_Tick
+	local npcPos = npc:GetPos()
+	local enemyPos = enemy:GetPos()
+
+	if npc.CachedKiteTime_NAPC and (cur - npc.CachedKiteTime_NAPC < 1.4) then
+		if
+			npc.CachedKiteEnemy_NAPC == enemy
+			and (npcPos - (npc.CachedKiteOrigin_NAPC or npcPos)):LengthSqr() < 19600
+		then
+			return npc.CachedKitePos_NAPC
+		end
+	end
+
 	minRange = minRange or 450
 	maxRange = maxRange or 850
 
-	local npcPos = npc:GetPos()
-	local enemyPos = enemy:GetPos()
 	local enemyEye = enemy:EyePos()
 	local awayDir = (npcPos - enemyPos):GetNormalized()
 	awayDir.z = 0
@@ -2538,7 +2487,7 @@ function NAPC.FindKiteRetreatPos(npc, enemy, allThreats, minRange, maxRange)
 	local bestPos = nil
 	local bestScore = -99999
 
-	local sampleAngles = { 0, -25, 25, -50, 50, -75, 75, 100, -100 }
+	local sampleAngles = { 0, -25, 25, -50, 50, -75, 75 }
 	local sampleDists = { 260, 420, 620 }
 
 	for _, dist in ipairs(sampleDists) do
@@ -2587,6 +2536,11 @@ function NAPC.FindKiteRetreatPos(npc, enemy, allThreats, minRange, maxRange)
 			end
 		end
 	end
+
+	npc.CachedKiteTime_NAPC = cur
+	npc.CachedKitePos_NAPC = bestPos
+	npc.CachedKiteEnemy_NAPC = enemy
+	npc.CachedKiteOrigin_NAPC = npcPos
 
 	return bestPos
 end
@@ -2668,6 +2622,7 @@ function NAPC.InitEnt(ent)
 					["SHELTERED_WARFARE"] = 0,
 					["HIGH_GROUND_REINFORCE"] = 0,
 					["COUNTER_HIGH_GROUND"] = 0,
+					["EXPLOIT_ENFILADE"] = 0,
 					["BAIT_RETREAT"] = 0,
 					["KITE_RETREAT"] = 0,
 					["FLANK_MANEUVER"] = 0,
@@ -2833,8 +2788,19 @@ function NAPC.FindEnfiladeVantagePos(npc, enemy, allThreats)
 		return nil
 	end
 
+	local cur = NAPC.CurTime_Tick
 	local npcPos = npc:GetPos()
 	local enemyPos = enemy:GetPos()
+
+	if npc.CachedEnfiladeTime_NAPC and (cur - npc.CachedEnfiladeTime_NAPC < 1.5) then
+		if
+			npc.CachedEnfiladeEnemy_NAPC == enemy
+			and (npcPos - (npc.CachedEnfiladeOrigin_NAPC or npcPos)):LengthSqr() < 22500
+		then
+			return npc.CachedEnfiladePos_NAPC
+		end
+	end
+
 	local enemyEye = enemy:EyePos()
 	local enemyAim = enemy:GetAimVector()
 	local enemyRight = enemyAim:Angle():Right()
@@ -2849,8 +2815,6 @@ function NAPC.FindEnfiladeVantagePos(npc, enemy, allThreats)
 		(-enemyRight * 420) - (enemyAim * 220),
 		(enemyRight * 680) + (enemyAim * 150),
 		(-enemyRight * 680) + (enemyAim * 150),
-		(enemyRight * 850) - (enemyAim * 120),
-		(-enemyRight * 850) - (enemyAim * 120),
 	}
 
 	for _, offset in ipairs(sampleVectors) do
@@ -2916,6 +2880,11 @@ function NAPC.FindEnfiladeVantagePos(npc, enemy, allThreats)
 			end
 		end
 	end
+
+	npc.CachedEnfiladeTime_NAPC = cur
+	npc.CachedEnfiladePos_NAPC = bestPos
+	npc.CachedEnfiladeEnemy_NAPC = enemy
+	npc.CachedEnfiladeOrigin_NAPC = npcPos
 
 	return bestPos
 end
@@ -3363,7 +3332,7 @@ function NAPC.Tick_ClearForcedGo(npc, enemy, curSched)
 			or ceca.LastDecision == "GROUP_ROUT"
 			or ceca.LastDecision == "BAIT_RETREAT"
 			or ceca.LastDecision == "BREAK_CROSSFIRE"
-			or ceca.LastDecision == "TAKE_COVER_SHOOTING_POS"
+			or ceca.LastDecision == "MEDIC_RETREAT"
 		)
 	local enemyDistSqr = IsValid(enemy) and enemy:Alive() and (myPos - enemy:GetPos()):LengthSqr() or math.huge
 	local isPointBlankMelee = not isRetreating
@@ -3494,18 +3463,37 @@ function NAPC.Tick_ClearForcedGo(npc, enemy, curSched)
 
 		if ceca then
 			ceca.ActionApplied = isArrived
-			ceca.DecisionTime = NAPC.CurTime_Tick + (isArrived and 1.2 or 0.3)
-			ceca.MovementLockTime = 0
-			ceca.NextCycle = NAPC.CurTime_Tick + 0.05
-			if IsValid(enemy) and npc:Visible(enemy) then
-				if
-					npc:HasCondition(COND.CAN_MELEE_ATTACK1)
-					and enemyDistSqr < 6400
-					and not NAPC.IsZombieOrHeadcrab(enemy)
-				then
-					npc:SetSchedule(SCHED_MELEE_ATTACK1)
-				else
-					npc:SetSchedule(SCHED_RANGE_ATTACK1)
+			ceca.DecisionTime = NAPC.CurTime_Tick + (isArrived and (isRetreating and 3.0 or 1.2) or 0.3)
+			ceca.MovementLockTime = isRetreating and (NAPC.CurTime_Tick + 2.0) or 0
+			ceca.NextCycle = NAPC.CurTime_Tick + (isRetreating and 0.4 or 0.05)
+
+			if IsValid(enemy) then
+				if isRetreating then
+					if not npc:Visible(enemy) then
+						npc:SetSchedule(SCHED_AMBUSH)
+					else
+						if
+							npc:HasCondition(COND.CAN_MELEE_ATTACK1)
+							and enemyDistSqr < 6400
+							and not NAPC.IsZombieOrHeadcrab(enemy)
+						then
+							npc:SetSchedule(SCHED_MELEE_ATTACK1)
+						elseif npc:HasCondition(COND.CAN_RANGE_ATTACK1) then
+							npc:SetSchedule(SCHED_RANGE_ATTACK1)
+						else
+							npc:SetSchedule(SCHED_TAKE_COVER_FROM_ENEMY)
+						end
+					end
+				elseif npc:Visible(enemy) then
+					if
+						npc:HasCondition(COND.CAN_MELEE_ATTACK1)
+						and enemyDistSqr < 6400
+						and not NAPC.IsZombieOrHeadcrab(enemy)
+					then
+						npc:SetSchedule(SCHED_MELEE_ATTACK1)
+					else
+						npc:SetSchedule(SCHED_RANGE_ATTACK1)
+					end
 				end
 			end
 		end
@@ -3526,15 +3514,24 @@ function NAPC.IsPlayerIgnored(ply)
 	if not IsValid(ply) or not ply:IsPlayer() then
 		return false
 	end
-	local cv = GetConVar("ai_ignoreplayers")
+
+	if ply.GetNoTarget and ply:GetNoTarget() then
+		return true
+	end
+
+	if ply.IsFlagSet and ply:IsFlagSet(FL_NOTARGET) then
+		return true
+	end
+
+	local cv = GetConVar("ai_ignoreplayers") or GetConVar("ignoreplayers")
 	if cv and cv:GetBool() then
 		return true
 	end
-	if ply:IsFlagSet(FL_NOTARGET) then
-		return true
-	end
+
 	return false
 end
+
+NAPC.PlayerVisionIgnored = NAPC.IsPlayerIgnored
 
 function NAPC.Tick_SeenByPlayer(npc, enemy)
 	if not IsValid(enemy) or NAPC.IsPlayerIgnored(enemy) then
@@ -3701,44 +3698,47 @@ function NAPC.FindCoverShootingPos(npc, enemy, allThreats, minDist, maxDist)
 	minDist = math.max(380, minDist or 380)
 	maxDist = math.max(minDist + 200, maxDist or 1350)
 
-	if npc.CachedCoverTime_NAPC and (cur - npc.CachedCoverTime_NAPC < 1.2) and npc.CachedCoverPos_NAPC then
+	if npc.CachedCoverTime_NAPC and (cur - npc.CachedCoverTime_NAPC < 1.4) then
 		if
 			npc.CachedCoverEnemy_NAPC == enemy
-			and (npcPos - (npc.CachedCoverOrigin_NAPC or npcPos)):LengthSqr() < 16000
+			and (npcPos - (npc.CachedCoverOrigin_NAPC or npcPos)):LengthSqr() < 19600
 		then
-			local d = (enemyPos - npc.CachedCoverPos_NAPC):Length()
+			local cached = npc.CachedCoverPos_NAPC
+			if not cached then
+				return nil
+			end
+			local d = (enemyPos - cached):Length()
 			if d >= minDist and d <= maxDist then
-				return npc.CachedCoverPos_NAPC
+				return cached
 			end
 		end
 	end
 
 	local enemyEye = enemy:EyePos()
 	local toEnemy = (enemyPos - npcPos):GetNormalized()
-	local rightVec = toEnemy:Angle():Right()
+	local baseAngle = toEnemy:Angle()
 
 	local bestPos = nil
 	local bestScore = -99999
+	local enemyAim = enemy:GetAimVector()
+	local myFaction = NAPC.AreaGetFactionOf(npc)
 
-	local sampleAngles = { -45, 45, -75, 75, -110, 110, 150, -150, -25, 25, 180 }
-	local sampleDists = { 240, 420, 650, 920 }
-
-	for _, dist in ipairs(sampleDists) do
-		for _, ang in ipairs(sampleAngles) do
-			local dir = (toEnemy:Angle() + Angle(0, ang, 0)):Forward()
+	for _, dist in ipairs(SAMPLE_DISTS_COVER) do
+		for _, ang in ipairs(SAMPLE_ANGLES_COVER) do
+			local dir = (baseAngle + Angle(0, ang, 0)):Forward()
 			local candidatePos = npcPos + (dir * dist)
 			local dToEnemy = (enemyPos - candidatePos):Length()
 
 			if dToEnemy >= minDist and dToEnemy <= maxDist and NAPC.IsDestinationValid(npc, candidatePos, false) then
-				NAPC.trData.start = candidatePos + Vector(0, 0, 128)
-				NAPC.trData.endpos = candidatePos - Vector(0, 0, 200)
+				NAPC.trData.start = candidatePos + Vector(0, 0, 96)
+				NAPC.trData.endpos = candidatePos - Vector(0, 0, 180)
 				NAPC.trData.mask = MASK_SOLID_BRUSHONLY
 				NAPC.trData.filter = nil
 				util.TraceLine(NAPC.trData)
 
 				if NAPC.trRes.Hit and not NAPC.trRes.StartSolid and NAPC.trRes.HitNormal.z > 0.65 then
 					local groundPos = NAPC.trRes.HitPos
-					if not NAPC.IsPositionInWater(groundPos) and not NAPC.IsPositionInFatalFunnel(groundPos) then
+					if not NAPC.IsPositionInWater(groundPos) then
 						local standEye = groundPos + Vector(0, 0, 64)
 
 						NAPC.trData.start = standEye
@@ -3746,9 +3746,8 @@ function NAPC.FindCoverShootingPos(npc, enemy, allThreats, minDist, maxDist)
 						NAPC.trData.filter = { npc, enemy }
 						NAPC.trData.mask = MASK_SHOT
 						util.TraceLine(NAPC.trData)
-						local canShootEnemy = (NAPC.trRes.Fraction >= 0.88 or NAPC.trRes.Entity == enemy)
 
-						if canShootEnemy then
+						if NAPC.trRes.Fraction >= 0.88 or NAPC.trRes.Entity == enemy then
 							local crouchEye = groundPos + Vector(0, 0, 36)
 							NAPC.trData.start = crouchEye
 							NAPC.trData.endpos = enemyEye
@@ -3758,44 +3757,17 @@ function NAPC.FindCoverShootingPos(npc, enemy, allThreats, minDist, maxDist)
 							local crouchCover = (NAPC.trRes.Fraction < 1.0 and NAPC.trRes.Entity ~= enemy)
 
 							local concealedSteps = 0
-							local threatShieldedSteps = 0
-							local testOffsets = {
-								rightVec * 44,
-								rightVec * -44,
-								toEnemy * -36,
-							}
+							if not crouchCover then
+								for _, stepVec in ipairs(SAMPLE_STEP_OFFSETS) do
+									NAPC.trData.start = standEye + stepVec
+									NAPC.trData.endpos = enemyEye
+									NAPC.trData.filter = { npc, enemy }
+									NAPC.trData.mask = MASK_SHOT
+									util.TraceLine(NAPC.trData)
 
-							for _, stepVec in ipairs(testOffsets) do
-								local stepEye = standEye + stepVec
-								NAPC.trData.start = stepEye
-								NAPC.trData.endpos = enemyEye
-								NAPC.trData.filter = { npc, enemy }
-								NAPC.trData.mask = MASK_SHOT
-								util.TraceLine(NAPC.trData)
-
-								if NAPC.trRes.Fraction < 1.0 and NAPC.trRes.Entity ~= enemy then
-									concealedSteps = concealedSteps + 1
-
-									local safeFromSecondary = true
-									if allThreats then
-										for tIdx = 1, math.min(#allThreats, 2) do
-											local threat = allThreats[tIdx]
-											if IsValid(threat) and threat ~= enemy then
-												NAPC.trData.start = stepEye
-												NAPC.trData.endpos = threat:EyePos()
-												NAPC.trData.filter = { npc, threat }
-												NAPC.trData.mask = MASK_SHOT
-												util.TraceLine(NAPC.trData)
-
-												if NAPC.trRes.Fraction >= 0.92 or NAPC.trRes.Entity == threat then
-													safeFromSecondary = false
-													break
-												end
-											end
-										end
-									end
-									if safeFromSecondary then
-										threatShieldedSteps = threatShieldedSteps + 1
+									if NAPC.trRes.Fraction < 1.0 and NAPC.trRes.Entity ~= enemy then
+										concealedSteps = concealedSteps + 1
+										break
 									end
 								end
 							end
@@ -3807,16 +3779,12 @@ function NAPC.FindCoverShootingPos(npc, enemy, allThreats, minDist, maxDist)
 								util.TraceHull(NAPC.hullTrData)
 
 								if not NAPC.hullTrRes.Hit then
-									local elevationBonus = math.Clamp((groundPos.z - enemyPos.z) * 0.5, -15, 60)
-									local avoidancePenalty =
-										NAPC.AreaGetDangerAtPos(groundPos, NAPC.AreaGetFactionOf(npc), cur, enemy)
-									local angleDisparity = (
-										1.0 - math.abs(enemy:GetAimVector():Dot((standEye - enemyEye):GetNormalized()))
-									) * 30
+									local elevationBonus = math.Clamp((groundPos.z - enemyPos.z) * 0.4, -15, 45)
+									local avoidancePenalty = NAPC.AreaGetDangerAtPos(groundPos, myFaction, cur, enemy)
+									local toCand = (standEye - enemyEye):GetNormalized()
+									local angleDisparity = (1.0 - math.abs(enemyAim:Dot(toCand))) * 30
 
-									local score = (crouchCover and 65 or 0)
-										+ (concealedSteps * 45)
-										+ (threatShieldedSteps * 35)
+									local score = (crouchCover and 65 or 45)
 										+ elevationBonus
 										+ angleDisparity
 										- (avoidancePenalty * 20)
@@ -3835,12 +3803,10 @@ function NAPC.FindCoverShootingPos(npc, enemy, allThreats, minDist, maxDist)
 		end
 	end
 
-	if bestPos then
-		npc.CachedCoverTime_NAPC = cur
-		npc.CachedCoverPos_NAPC = bestPos
-		npc.CachedCoverEnemy_NAPC = enemy
-		npc.CachedCoverOrigin_NAPC = npcPos
-	end
+	npc.CachedCoverTime_NAPC = cur
+	npc.CachedCoverPos_NAPC = bestPos
+	npc.CachedCoverEnemy_NAPC = enemy
+	npc.CachedCoverOrigin_NAPC = npcPos
 
 	return bestPos
 end
@@ -3929,11 +3895,178 @@ function NAPC.OODA_DispatchMove(npc, ooda, targetPos, fallbackSched, speedMul, l
 	end
 end
 
+function NAPC.FindKeyTargetPriority(npc, currentEnemy)
+	if not IsValid(npc) then
+		return nil, nil
+	end
+
+	local myPos = npc:GetPos()
+	local maxHp = math.max(1, npc:GetMaxHealth())
+	local hpRatio = npc:Health() / maxHp
+
+	if hpRatio < 0.35 or (npc.DamageBuffer_NAPC or 0) > (maxHp * 0.25) then
+		return nil, nil
+	end
+
+	if IsValid(currentEnemy) and currentEnemy:Alive() then
+		local curDist = (currentEnemy:GetPos() - myPos):Length()
+		if curDist < 350 or NAPC.IsZombieOrHeadcrab(currentEnemy) then
+			return currentEnemy, "IMMEDIATE_THREAT"
+		end
+	end
+
+	local mySquadID = NAPC.GetSquadID(npc)
+	local squadTarget = nil
+	if mySquadID and NAPC.TheaterSquads[mySquadID] then
+		squadTarget = NAPC.TheaterSquads[mySquadID].target
+	end
+
+	local ooda = npc.OODA or npc.CECA
+	local isStandoff = ooda
+		and (
+			ooda.LastDecision == "HOLD_AND_ATTACK"
+			or ooda.LastDecision == "SUPPRESSIVE_FIRE"
+			or (ooda.PosStayTime and (NAPC.CurTime_Tick - ooda.PosStayTime) > 3.0)
+		)
+
+	local bestTarget = nil
+	local bestReason = "STANDOFF_FOCUS"
+	local bestScore = -math.huge
+	local candidates = {}
+	local seen = {}
+
+	if IsValid(currentEnemy) and currentEnemy:Alive() then
+		candidates[#candidates + 1] = currentEnemy
+		seen[currentEnemy] = true
+	end
+
+	if IsValid(squadTarget) and squadTarget:Alive() and not seen[squadTarget] then
+		candidates[#candidates + 1] = squadTarget
+		seen[squadTarget] = true
+	end
+
+	for _, ply in player.Iterator() do
+		if
+			IsValid(ply)
+			and ply:Alive()
+			and not seen[ply]
+			and not NAPC.IsFriendly(npc, ply)
+			and not NAPC.IsPlayerIgnored(ply)
+		then
+			local dSqr = (ply:GetPos() - myPos):LengthSqr()
+			if dSqr <= 16000000 then
+				candidates[#candidates + 1] = ply
+				seen[ply] = true
+			end
+		end
+	end
+
+	for ent, _ in pairs(NAPC.CurNPCList) do
+		if
+			IsValid(ent)
+			and ent:IsNPC()
+			and ent ~= npc
+			and ent:Alive()
+			and not seen[ent]
+			and not NAPC.IsFriendly(npc, ent)
+		then
+			local dSqr = (ent:GetPos() - myPos):LengthSqr()
+			if dSqr <= 16000000 then
+				candidates[#candidates + 1] = ent
+				seen[ent] = true
+			end
+		end
+	end
+
+	for _, target in ipairs(candidates) do
+		local tPos = target:GetPos()
+		local dist = (tPos - myPos):Length()
+		local hasLOS = npc:Visible(target) or npc:VisibleVec(target:WorldSpaceCenter())
+
+		if hasLOS or dist < 1400 then
+			local score = 0
+			local reason = "STANDOFF_FOCUS"
+			local tMaxHp = target.GetMaxHealth and target:GetMaxHealth() or 100
+			local tHp = target:Health()
+			local tHpRatio = tHp / math.max(1, tMaxHp)
+
+			if tHpRatio <= 0.35 or tHp <= 30 then
+				score = score + (isStandoff and 60 or 45) + ((1.0 - tHpRatio) * 35)
+				reason = "EXECUTE_LOW_HP"
+			elseif tHpRatio <= 0.60 then
+				score = score + (isStandoff and 30 or 20)
+				reason = "CHIP_WEAKENED"
+			end
+
+			local wep = target.GetActiveWeapon and target:GetActiveWeapon() or NULL
+			if IsValid(wep) then
+				if NAPC.IsRocketLauncher(wep) then
+					score = score + 55
+					reason = "RPG_LAUNCHER"
+				elseif wep:GetClass() == "weapon_shotgun" and dist < 700 then
+					score = score + 35
+					reason = "CLOSE_SHOTGUN"
+				elseif
+					wep:GetClass() == "weapon_ar2"
+					or wep:GetClass() == "weapon_357"
+					or wep:GetClass() == "weapon_crossbow"
+				then
+					score = score + 25
+				end
+			end
+
+			local tClass = target:GetClass()
+			if tClass == "npc_citizen" and target:HasSpawnFlags(SF_CITIZEN_MEDIC) then
+				score = score + 45
+				reason = "MEDIC_SUPPORT"
+			elseif tClass == "npc_combine_s" and target:GetInternalVariable("m_fIsElite") then
+				score = score + 25
+				reason = "SQUAD_LEADER"
+			elseif tClass == "npc_hunter" then
+				score = score + 30
+				reason = "HUNTER_THREAT"
+			end
+
+			if squadTarget == target then
+				score = score + 35
+			end
+
+			if hasLOS then
+				score = score + 40
+			else
+				score = score - 30
+			end
+
+			score = score - (dist * 0.012)
+
+			local tAim = target.GetAimVector and target:GetAimVector()
+			if tAim and hasLOS then
+				local toMe = (npc:EyePos() - target:EyePos()):GetNormalized()
+				if tAim:Dot(toMe) > 0.85 and (npc.DamageBuffer_NAPC or 0) > 10 then
+					score = score - 15
+				end
+			end
+
+			if target == currentEnemy then
+				score = score + 12
+			end
+
+			if score > bestScore then
+				bestScore = score
+				bestTarget = target
+				bestReason = reason
+			end
+		end
+	end
+
+	return bestTarget, bestReason
+end
+
 function NAPC.UpdateTheaterOrchestration()
 	if NAPC.CurTime_Tick < NAPC.NextTheaterUpdate then
 		return
 	end
-	NAPC.NextTheaterUpdate = NAPC.CurTime_Tick + 0.5
+	NAPC.NextTheaterUpdate = NAPC.CurTime_Tick + 0.65
 
 	local activeSquads = {}
 	NAPC.TheaterSquads = {}
@@ -3976,28 +4109,33 @@ function NAPC.UpdateTheaterOrchestration()
 	end
 
 	local combineSquadGroups = NAPC.ClusterUnitsIntoSquads(combineSoldiers, "combine_squad_", 3, 6)
-	for sIdx, group in ipairs(combineSquadGroups) do
+	for sIdx = 1, #combineSquadGroups do
 		local sqID = "combine_squad_" .. sIdx
-		for _, member in ipairs(group) do
-			member.DynamicSquadID_NAPC = sqID
+		local group = combineSquadGroups[sIdx]
+		for mIdx = 1, #group do
+			group[mIdx].DynamicSquadID_NAPC = sqID
 		end
 	end
 
 	local metroSquadGroups = NAPC.ClusterUnitsIntoSquads(metropoliceActive, "metro_squad_", 3, 6)
-	for sIdx, group in ipairs(metroSquadGroups) do
+	for sIdx = 1, #metroSquadGroups do
 		local sqID = "metro_squad_" .. sIdx
-		for _, member in ipairs(group) do
-			member.DynamicSquadID_NAPC = sqID
+		local group = metroSquadGroups[sIdx]
+		for mIdx = 1, #group do
+			group[mIdx].DynamicSquadID_NAPC = sqID
 		end
 	end
-	for _, brokenCop in ipairs(metropoliceBroken) do
+	for i = 1, #metropoliceBroken do
+		local brokenCop = metropoliceBroken[i]
 		brokenCop.DynamicSquadID_NAPC = "metro_broken_" .. brokenCop:EntIndex()
 	end
 
-	for _, reb in ipairs(resistanceCombatants) do
+	for i = 1, #resistanceCombatants do
+		local reb = resistanceCombatants[i]
 		local myPos = reb:GetPos()
 		local assignedID = nil
-		for _, mate in ipairs(resistanceCombatants) do
+		for j = 1, #resistanceCombatants do
+			local mate = resistanceCombatants[j]
 			if mate ~= reb and mate.DynamicSquadID_NAPC and (mate:GetPos() - myPos):LengthSqr() <= 422500 then
 				assignedID = mate.DynamicSquadID_NAPC
 				break
@@ -4006,7 +4144,8 @@ function NAPC.UpdateTheaterOrchestration()
 		reb.DynamicSquadID_NAPC = assignedID or ("rebel_sq_" .. reb:EntIndex())
 	end
 
-	for _, other in ipairs(otherCombatants) do
+	for i = 1, #otherCombatants do
+		local other = otherCombatants[i]
 		other.DynamicSquadID_NAPC = other.DynamicSquadID_NAPC or ("other_sq_" .. other:EntIndex())
 	end
 
@@ -4044,116 +4183,17 @@ function NAPC.UpdateTheaterOrchestration()
 		end
 	end
 
-	for sqID, sq in pairs(activeSquads) do
-		if IsValid(sq.target) and sq.target:Alive() then
-			local targetPos = sq.target:GetPos()
-
-			for _, member in ipairs(sq.members) do
-				if IsValid(member) and member:Alive() then
-					local curE = member:GetEnemy()
-					if not IsValid(curE) or not curE:Alive() then
-						member:SetEnemy(sq.target)
-						member:UpdateEnemyMemory(sq.target, targetPos)
-						if member:GetNPCState() ~= NPC_STATE_COMBAT then
-							member:SetNPCState(NPC_STATE_COMBAT)
-						end
-					end
-				end
-			end
-
-			local sqLeader = sq.members[1]
-			if IsValid(sqLeader) then
-				for otherNpc, _ in pairs(NAPC.CurNPCList) do
-					if
-						IsValid(otherNpc)
-						and otherNpc:IsNPC()
-						and otherNpc:Alive()
-						and NAPC.IsFriendly(sqLeader, otherNpc)
-						and (otherNpc:GetPos() - sq.center):LengthSqr() <= 20250000
-					then
-						local otherSquadID = NAPC.GetSquadID(otherNpc)
-						if otherSquadID ~= sqID then
-							local curE = otherNpc:GetEnemy()
-							local needsTarget = not IsValid(curE) or not curE:Alive()
-							local canSeeCurrent = IsValid(curE) and otherNpc:Visible(curE)
-
-							if needsTarget or (curE ~= sq.target and not canSeeCurrent) then
-								otherNpc:UpdateEnemyMemory(sq.target, targetPos)
-								otherNpc:SetEnemy(sq.target)
-								if otherNpc:GetNPCState() ~= NPC_STATE_COMBAT then
-									otherNpc:SetNPCState(NPC_STATE_COMBAT)
-								end
-
-								local curSched = otherNpc:GetCurrentSchedule()
-								local isMoving = NAPC.Tables.BannedSchedule_List3[curSched]
-									or (otherNpc.ForcedGoPos_NAPC ~= nil)
-								local isScripted = NAPC.Tables.BannedSchedule_List1[curSched]
-
-								if
-									not isMoving
-									and not isScripted
-									and not otherNpc:Visible(sq.target)
-									and not NAPC.Tables.ActiveCombatSchedules[curSched]
-								then
-									local seq = string.lower(otherNpc:GetSequenceName(otherNpc:GetSequence()) or "")
-									local isDeploying = string.find(seq, "manhack")
-										or string.find(seq, "gren")
-										or string.find(seq, "throw")
-										or string.find(seq, "deploy")
-
-									if not isDeploying then
-										local approachPos = NAPC.FindCoverShootingPos(
-											otherNpc,
-											sq.target,
-											nil,
-											350,
-											950
-										) or NAPC.FindFlankPos(otherNpc, sq.target, nil)
-										if approachPos and NAPC.IsDestinationValid(otherNpc, approachPos, false) then
-											local ooda = otherNpc.OODA or otherNpc.CECA
-											if ooda then
-												NAPC.OODA_DispatchMove(
-													otherNpc,
-													ooda,
-													approachPos,
-													SCHED_ESTABLISH_LINE_OF_FIRE,
-													1.35,
-													3.0
-												)
-											else
-												otherNpc:SetSaveValue("m_vecLastPosition", approachPos)
-												otherNpc:SetSchedule(SCHED_FORCED_GO_RUN)
-											end
-										else
-											otherNpc:SetSchedule(SCHED_ESTABLISH_LINE_OF_FIRE)
-										end
-									end
-								end
-
-								if
-									otherNpc.OODA
-									and (
-										otherNpc.OODA.LastDecision == "NONE"
-										or otherNpc.OODA.LastDecision == "HOLD_AND_ATTACK"
-									)
-								then
-									otherNpc.OODA.NextCycle = NAPC.CurTime_Tick + math.Rand(0.05, 0.25)
-									otherNpc.OODA.DecisionTime = 0
-									otherNpc.OODA.ActionApplied = false
-								end
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-
 	local enemyEngagementTheaters = {}
 	for sqID, sq in pairs(activeSquads) do
 		local count = #sq.members
 		if count > 0 then
 			sq.center = sq.center / count
+
+			local focusTarget = NAPC.FindKeyTargetPriority(sq.members[1], sq.target)
+			if IsValid(focusTarget) and focusTarget:Alive() then
+				sq.target = focusTarget
+			end
+
 			local targetEnt = sq.target
 			if not enemyEngagementTheaters[targetEnt] then
 				enemyEngagementTheaters[targetEnt] = {}
@@ -4166,8 +4206,10 @@ function NAPC.UpdateTheaterOrchestration()
 		local targetPos = targetEnemy:GetPos()
 		local numSquads = #squadList
 
-		for _, sq in ipairs(squadList) do
-			for _, member in ipairs(sq.members) do
+		for s = 1, numSquads do
+			local sq = squadList[s]
+			for m = 1, #sq.members do
+				local member = sq.members[m]
 				if IsValid(member) and member:Alive() then
 					local curE = member:GetEnemy()
 					if not IsValid(curE) or not curE:Alive() or (curE ~= targetEnemy and not member:Visible(curE)) then
@@ -4210,28 +4252,14 @@ function NAPC.UpdateTheaterOrchestration()
 
 			for i = 2, numSquads - 1 do
 				local sideSquad = squadList[i]
-
 				if i == 2 and numSquads >= 3 then
 					sideSquad.role = "SQUAD_ROLE_SECURE"
-					sideSquad.hasCoveringFire = suppressSquad.isCoveringAllies
-					sideSquad.isCoveringAllies = false
-					NAPC.TheaterSquads[sideSquad.id] = sideSquad
 				else
 					sideSquad.role = "SQUAD_ROLE_FLANK"
-					sideSquad.hasCoveringFire = suppressSquad.isCoveringAllies
-					sideSquad.isCoveringAllies = false
-
-					local dirToTarget = (targetPos - suppressSquad.center)
-					dirToTarget.z = 0
-					if dirToTarget:IsZero() then
-						dirToTarget = suppressSquad.center:GetNormalized()
-					else
-						dirToTarget = dirToTarget:GetNormalized()
-					end
-
-					sideSquad.flankVector = dirToTarget:Angle():Right() * ((i % 2 == 0) and 1 or -1)
-					NAPC.TheaterSquads[sideSquad.id] = sideSquad
 				end
+				sideSquad.hasCoveringFire = suppressSquad.isCoveringAllies
+				sideSquad.isCoveringAllies = false
+				NAPC.TheaterSquads[sideSquad.id] = sideSquad
 			end
 		end
 	end
@@ -4241,20 +4269,23 @@ function NAPC.BroadcastDebugInfo()
 	if NAPC.CurTime_Tick < NAPC.NextDebugBroadcast then
 		return
 	end
-	NAPC.NextDebugBroadcast = NAPC.CurTime_Tick + 0.15
 
+	local devCount = 0
 	local devPlayers = {}
 	local devPositions = {}
 	for _, ply in player.Iterator() do
 		if IsValid(ply) and (ply:GetInfoNum("developer", 0) > 0 or GetConVar("developer"):GetInt() > 0) then
-			table.insert(devPlayers, ply)
-			table.insert(devPositions, ply:GetPos())
+			devCount = devCount + 1
+			devPlayers[devCount] = ply
+			devPositions[devCount] = ply:GetPos()
 		end
 	end
 
-	if #devPlayers == 0 then
+	if devCount == 0 then
+		NAPC.NextDebugBroadcast = NAPC.CurTime_Tick + 1.0
 		return
 	end
+	NAPC.NextDebugBroadcast = NAPC.CurTime_Tick + 0.2
 
 	local cur = NAPC.CurTime_Tick
 	local debugData = {
@@ -4263,6 +4294,7 @@ function NAPC.BroadcastDebugInfo()
 		dangerZones = {},
 		grenadeArcs = {},
 		areaScores = {},
+		priorityTargets = {},
 		casualties = #NAPC.RecentCasualties,
 		missiles = 0,
 	}
@@ -4277,7 +4309,7 @@ function NAPC.BroadcastDebugInfo()
 	for _, rec in pairs(NAPC.AreaScoreRecords) do
 		if cur <= (rec.trackedUntil + 5) and isvector(rec.pos) then
 			local minDistSqr = math.huge
-			for i = 1, #devPositions do
+			for i = 1, devCount do
 				local dSqr = (rec.pos - devPositions[i]):LengthSqr()
 				if dSqr < minDistSqr then
 					minDistSqr = dSqr
@@ -4294,7 +4326,7 @@ function NAPC.BroadcastDebugInfo()
 		return a.distSqr < b.distSqr
 	end)
 
-	local maxAreasToSend = 64
+	local maxAreasToSend = 32
 	for i = 1, math.min(#candidateAreas, maxAreasToSend) do
 		local rec = candidateAreas[i].rec
 		local faction = NAPC.AreaDebugNearestFaction(rec.pos)
@@ -4313,7 +4345,7 @@ function NAPC.BroadcastDebugInfo()
 		})
 	end
 
-	for i = 1, math.min(#NAPC.LethalDangerZones, 12) do
+	for i = 1, math.min(#NAPC.LethalDangerZones, 8) do
 		local z = NAPC.LethalDangerZones[i]
 		if z and z.expire > cur and isvector(z.pos) then
 			table.insert(debugData.dangerZones, {
@@ -4329,7 +4361,7 @@ function NAPC.BroadcastDebugInfo()
 		local arc = NAPC.DebugGrenadeArcs[i]
 		if not arc or cur > arc.expire then
 			table.remove(NAPC.DebugGrenadeArcs, i)
-		elseif #debugData.grenadeArcs < 8 then
+		elseif #debugData.grenadeArcs < 6 then
 			table.insert(debugData.grenadeArcs, {
 				path = arc.path,
 				bounces = arc.bounces,
@@ -4339,6 +4371,8 @@ function NAPC.BroadcastDebugInfo()
 			})
 		end
 	end
+
+	local priorityTargetMap = {}
 
 	for sqID, sq in pairs(NAPC.TheaterSquads) do
 		local memberIndices = {}
@@ -4366,6 +4400,26 @@ function NAPC.BroadcastDebugInfo()
 			local ooda = npc.OODA or npc.CECA
 			local enemy = npc:GetEnemy()
 			local wep = npc:GetActiveWeapon()
+			local pTarget = npc.PriorityTarget_NAPC
+
+			if IsValid(pTarget) and pTarget:Alive() then
+				local pIdx = pTarget:EntIndex()
+				if not priorityTargetMap[pIdx] then
+					local maxHp = pTarget.GetMaxHealth and pTarget:GetMaxHealth() or 100
+					priorityTargetMap[pIdx] = {
+						entIdx = pIdx,
+						class = pTarget:GetClass(),
+						pos = pTarget:GetPos(),
+						wsc = pTarget:WorldSpaceCenter(),
+						health = pTarget:Health(),
+						maxHealth = maxHp,
+						hpRatio = math.Round(pTarget:Health() / math.max(1, maxHp), 2),
+						reason = npc.PriorityReason_NAPC or "STANDOFF_FOCUS",
+						targetedBy = 0,
+					}
+				end
+				priorityTargetMap[pIdx].targetedBy = priorityTargetMap[pIdx].targetedBy + 1
+			end
 
 			local topTactics = {}
 			if ooda and ooda.TacticalScores then
@@ -4394,6 +4448,8 @@ function NAPC.BroadcastDebugInfo()
 				enemyClass = IsValid(enemy) and enemy:GetClass() or "none",
 				enemyDist = IsValid(enemy) and math.Round((enemy:GetPos() - npc:GetPos()):Length(), 0) or 0,
 				hasLOS = IsValid(enemy) and npc:Visible(enemy) or false,
+				priorityTargetIdx = IsValid(pTarget) and pTarget:EntIndex() or nil,
+				priorityReason = npc.PriorityReason_NAPC or nil,
 				forcedGo = npc.ForcedGoPos_NAPC,
 				waypointPath = npc.WaypointPath_NAPC,
 				waypointIndex = npc.WaypointIndex_NAPC or 1,
@@ -4410,6 +4466,10 @@ function NAPC.BroadcastDebugInfo()
 				} or nil,
 			})
 		end
+	end
+
+	for _, pt in pairs(priorityTargetMap) do
+		table.insert(debugData.priorityTargets, pt)
 	end
 
 	net.Start("NAPC_DebugData")
@@ -4452,6 +4512,15 @@ function NAPC.NotifyThreat(sourceNpc, enemy, enemyPos, alertRadius)
 					local needsTarget = not IsValid(currentEnemy) or not currentEnemy:Alive()
 					local canSeeCurrent = IsValid(currentEnemy) and ally:Visible(currentEnemy)
 
+					local allyOoda = ally.OODA or ally.CECA
+					local isAllyRetreating = allyOoda
+						and (
+							allyOoda.LastDecision == "INDIVIDUAL_RETREAT"
+							or allyOoda.LastDecision == "GROUP_ROUT"
+							or allyOoda.LastDecision == "MEDIC_RETREAT"
+							or allyOoda.LastDecision == "KITE_RETREAT"
+						)
+
 					if needsTarget or (currentEnemy ~= enemy and not canSeeCurrent) then
 						ally:SetEnemy(enemy)
 						ally:UpdateEnemyMemory(enemy, ePos)
@@ -4467,6 +4536,7 @@ function NAPC.NotifyThreat(sourceNpc, enemy, enemyPos, alertRadius)
 							not isMoving
 							and not isScripted
 							and not ally:Visible(enemy)
+							and not isAllyRetreating
 							and not NAPC.Tables.ActiveCombatSchedules[curSched]
 						then
 							local seq = string.lower(ally:GetSequenceName(ally:GetSequence()) or "")
@@ -4479,11 +4549,10 @@ function NAPC.NotifyThreat(sourceNpc, enemy, enemyPos, alertRadius)
 								local approachPos = NAPC.FindCoverShootingPos(ally, enemy, nil, 350, 950)
 									or NAPC.FindFlankPos(ally, enemy, nil)
 								if approachPos and NAPC.IsDestinationValid(ally, approachPos, false) then
-									local ooda = ally.OODA or ally.CECA
-									if ooda then
+									if allyOoda then
 										NAPC.OODA_DispatchMove(
 											ally,
-											ooda,
+											allyOoda,
 											approachPos,
 											SCHED_ESTABLISH_LINE_OF_FIRE,
 											1.35,
@@ -4500,11 +4569,7 @@ function NAPC.NotifyThreat(sourceNpc, enemy, enemyPos, alertRadius)
 						end
 					end
 
-					if
-						ally.OODA
-						and ally.OODA.LastDecision ~= "INDIVIDUAL_RETREAT"
-						and ally.OODA.LastDecision ~= "GROUP_ROUT"
-					then
+					if ally.OODA and not isAllyRetreating then
 						local isIdle = ally.OODA.LastDecision == "NONE" or ally.OODA.LastDecision == "HOLD_AND_ATTACK"
 						if isIdle or NAPC.CurTime_Tick > (ally.OODA.NextCycle or 0) then
 							ally.OODA.NextCycle = NAPC.CurTime_Tick + math.Rand(0.05, 0.2)
@@ -4777,6 +4842,7 @@ function NAPC.CheckIncomingRocket(npc)
 		return nil, nil, nil
 	end
 	local npcPos = npc:WorldSpaceCenter()
+	local cur = NAPC.CurTime_Tick
 
 	for missile, _ in pairs(NAPC.ActiveMissiles) do
 		if not IsValid(missile) then
@@ -4819,56 +4885,75 @@ function NAPC.CheckIncomingRocket(npc)
 		end
 	end
 
-	local nearby = ents.FindInSphere(npcPos, 900)
-	for _, ent in ipairs(nearby) do
-		if IsValid(ent) and ent ~= npc and not NAPC.ActiveMissiles[ent] then
-			local class = ent:GetClass()
-			local isGrenade = (class == "npc_grenade_frag" or class == "grenade_ar2" or class == "prop_combine_ball")
-			local isOtherMissile = (not isGrenade) and NAPC.IsRocketEntity(ent)
+	if cur > (npc.NextNearbyProjCheck_NAPC or 0) then
+		npc.NextNearbyProjCheck_NAPC = cur + 0.35
+		local nearby = ents.FindInSphere(npcPos, 700)
+		for i = 1, #nearby do
+			local ent = nearby[i]
+			if IsValid(ent) and ent ~= npc and not NAPC.ActiveMissiles[ent] then
+				local class = ent:GetClass()
+				local isGrenade = (
+					class == "npc_grenade_frag"
+					or class == "grenade_ar2"
+					or class == "prop_combine_ball"
+				)
+				local isOtherMissile = (not isGrenade) and NAPC.IsRocketEntity(ent)
 
-			if isGrenade or isOtherMissile then
-				local ePos = ent:GetPos()
-				local toNpc = npcPos - ePos
-				local distSqr = toNpc:LengthSqr()
-				local vel = ent:GetVelocity()
-				local speedSqr = vel:LengthSqr()
-				local dist = math.sqrt(distSqr)
+				if isGrenade or isOtherMissile then
+					local ePos = ent:GetPos()
+					local toNpc = npcPos - ePos
+					local distSqr = toNpc:LengthSqr()
+					local vel = ent:GetVelocity()
+					local speedSqr = vel:LengthSqr()
+					local dist = math.sqrt(distSqr)
 
-				local isThreat = false
-				if speedSqr > 4900 then
-					local speed = math.sqrt(speedSqr)
-					local heading = vel / speed
-					local dirToNpc = toNpc / math.max(1, dist)
-					local dot = heading:Dot(dirToNpc)
+					local isThreat = false
+					if speedSqr > 4900 then
+						local speed = math.sqrt(speedSqr)
+						local heading = vel / speed
+						local dirToNpc = toNpc / math.max(1, dist)
+						local dot = heading:Dot(dirToNpc)
 
-					if dot > 0.35 then
-						isThreat = true
-					else
-						local proj = toNpc:Dot(heading)
-						if proj > 0 then
-							local closestPoint = ePos + (heading * proj)
-							local missDist = (npcPos - closestPoint):Length()
-							if missDist < 320 and (proj / speed) < 2.5 then
-								isThreat = true
+						if dot > 0.35 then
+							isThreat = true
+						else
+							local proj = toNpc:Dot(heading)
+							if proj > 0 then
+								local closestPoint = ePos + (heading * proj)
+								local missDist = (npcPos - closestPoint):Length()
+								if missDist < 320 and (proj / speed) < 2.5 then
+									isThreat = true
+								end
 							end
 						end
 					end
-				end
 
-				if not isThreat and dist < 380 then
-					if isGrenade then
-						isThreat = true
+					if not isThreat and dist < 380 then
+						if isGrenade then
+							isThreat = true
+						end
 					end
-				end
 
-				if isThreat then
-					if isOtherMissile then
-						NAPC.ActiveMissiles[ent] = true
+					if isThreat then
+						if isOtherMissile then
+							NAPC.ActiveMissiles[ent] = true
+						end
+						npc.CachedThreatProj_NAPC = ent
+						npc.CachedThreatProjPos_NAPC = ePos
+						npc.CachedThreatProjVel_NAPC = vel
+						npc.CachedThreatProjTime_NAPC = cur + 0.4
+						return ent, ePos, vel
 					end
-					return ent, ePos, vel
 				end
 			end
 		end
+		npc.CachedThreatProj_NAPC = nil
+	elseif
+		npc.CachedThreatProj_NAPC
+		and cur < (npc.CachedThreatProjTime_NAPC or 0)
+		and IsValid(npc.CachedThreatProj_NAPC)
+	then
+		return npc.CachedThreatProj_NAPC, npc.CachedThreatProj_NAPC:GetPos(), npc.CachedThreatProj_NAPC:GetVelocity()
 	end
 
 	return nil, nil, nil
@@ -4918,104 +5003,75 @@ function NAPC.Tick_RocketEvade(npc, curSched)
 	return false
 end
 
-function NAPC.IsPositionInFatalFunnel(pos)
-	if not pos then
-		return false
-	end
-
-	local checkCenter = pos + Vector(0, 0, 36)
-	local lateralEnclosure = 0
-	local directions = {
-		Vector(1, 0, 0),
-		Vector(-1, 0, 0),
-		Vector(0, 1, 0),
-		Vector(0, -1, 0),
-		Vector(0.707, 0.707, 0),
-		Vector(-0.707, -0.707, 0),
-		Vector(-0.707, 0.707, 0),
-		Vector(0.707, -0.707, 0),
-	}
-
-	for _, dir in ipairs(directions) do
-		local tr = util.TraceLine({
-			start = checkCenter,
-			endpos = checkCenter + (dir * 360),
-			mask = MASK_SOLID_BRUSHONLY,
-		})
-		if tr.Hit and not tr.StartSolid and math.abs(tr.HitNormal.z) < 0.35 then
-			lateralEnclosure = lateralEnclosure + 1
-		end
-	end
-
-	return lateralEnclosure >= 3
-end
-
-function NAPC.FindFunnelOverwatchPos(npc, enemy, allThreats)
+function NAPC.FindRetreatPos(npc, enemy, allThreats)
 	if not IsValid(npc) or not IsValid(enemy) then
 		return nil
 	end
 
+	local cur = NAPC.CurTime_Tick
 	local npcPos = npc:GetPos()
 	local enemyPos = enemy:GetPos()
-	local enemyEye = enemy:EyePos()
-	local toEnemy = (enemyPos - npcPos):GetNormalized()
 
-	local bestPos = nil
-	local bestScore = -9999
-
-	local candidatePositions = NAPC.GetReachableNavCandidates(npc, 950, 260, 10)
-	if not candidatePositions or #candidatePositions == 0 then
-		candidatePositions = {}
-		local rightVec = toEnemy:Angle():Right()
-		local sampleOffsets = {
-			(rightVec * 480) - (toEnemy * 120),
-			(rightVec * 650) - (toEnemy * 60),
-			(-rightVec * 480) - (toEnemy * 120),
-			(-rightVec * 650) - (toEnemy * 60),
-			(rightVec * 550) + (toEnemy * 180),
-			(-rightVec * 550) + (toEnemy * 180),
-		}
-		for _, offset in ipairs(sampleOffsets) do
-			candidatePositions[#candidatePositions + 1] = npcPos + offset
+	if npc.CachedRetreatTime_NAPC and (cur - npc.CachedRetreatTime_NAPC < 1.8) then
+		if
+			npc.CachedRetreatEnemy_NAPC == enemy
+			and (npcPos - (npc.CachedRetreatOrigin_NAPC or npcPos)):LengthSqr() < 22500
+		then
+			return npc.CachedRetreatPos_NAPC
 		end
 	end
 
-	for _, candidatePos in ipairs(candidatePositions) do
-		if NAPC.IsDestinationValid(npc, candidatePos, false) then
-			NAPC.trData.start = candidatePos + Vector(0, 0, 200)
-			NAPC.trData.endpos = candidatePos - Vector(0, 0, 250)
-			NAPC.trData.mask = MASK_SOLID_BRUSHONLY
-			NAPC.trData.filter = nil
-			util.TraceLine(NAPC.trData)
+	local enemyEye = enemy:EyePos()
+	local awayDir = (npcPos - enemyPos):GetNormalized()
+	awayDir.z = 0
+	if awayDir:IsZero() then
+		awayDir = -npc:GetForward()
+		awayDir.z = 0
+	end
+	awayDir:Normalize()
+	local awayAngle = awayDir:Angle()
+	local myFaction = NAPC.AreaGetFactionOf(npc)
 
-			if NAPC.trRes.Hit and not NAPC.trRes.StartSolid and NAPC.trRes.HitNormal.z > 0.65 then
-				local groundPos = NAPC.trRes.HitPos
+	local bestPos = nil
+	local bestScore = -math.huge
 
-				if not NAPC.IsPositionInWater(groundPos) and not NAPC.IsPositionInFatalFunnel(groundPos) then
-					local standEye = groundPos + Vector(0, 0, 64)
+	local sampleAngles = { 0, -25, 25, -50, 50, -75, 75, -110, 110, 140, -140, 180 }
+	local sampleDists = { 500, 750, 1050 }
 
-					NAPC.trData.start = standEye
-					NAPC.trData.endpos = enemyEye
-					NAPC.trData.filter = { npc, enemy }
-					NAPC.trData.mask = MASK_SHOT
-					util.TraceLine(NAPC.trData)
+	for _, dist in ipairs(sampleDists) do
+		for _, ang in ipairs(sampleAngles) do
+			local dir = (awayAngle + Angle(0, ang, 0)):Forward()
+			local candidatePos = npcPos + (dir * dist)
+			local dToEnemy = (candidatePos - enemyPos):Length()
 
-					if NAPC.trRes.Fraction >= 0.90 or NAPC.trRes.Entity == enemy then
+			if dToEnemy >= 500 and NAPC.IsDestinationValid(npc, candidatePos, false) then
+				NAPC.trData.start = candidatePos + Vector(0, 0, 96)
+				NAPC.trData.endpos = candidatePos - Vector(0, 0, 256)
+				NAPC.trData.mask = MASK_SOLID_BRUSHONLY
+				NAPC.trData.filter = nil
+				util.TraceLine(NAPC.trData)
+
+				if NAPC.trRes.Hit and not NAPC.trRes.StartSolid and NAPC.trRes.HitNormal.z > 0.65 then
+					local groundPos = NAPC.trRes.HitPos
+					if not NAPC.IsPositionInWater(groundPos) and not NAPC.IsPosNearLethalDanger(groundPos, 48) then
+						local standEye = groundPos + Vector(0, 0, 64)
+
+						NAPC.trData.start = standEye
+						NAPC.trData.endpos = enemyEye
+						NAPC.trData.filter = { npc, enemy }
+						NAPC.trData.mask = MASK_SHOT
+						util.TraceLine(NAPC.trData)
+
+						local isHidden = (NAPC.trRes.Fraction < 1.0 and NAPC.trRes.Entity ~= enemy)
+
 						NAPC.hullTrData.start = groundPos + Vector(0, 0, 5)
 						NAPC.hullTrData.endpos = groundPos + Vector(0, 0, 60)
 						NAPC.hullTrData.filter = nil
 						util.TraceHull(NAPC.hullTrData)
 
 						if not NAPC.hullTrRes.Hit then
-							local elevationVsEnemy = math.Clamp(groundPos.z - enemyPos.z, -30, 200)
-							local toCandidate = (groundPos - enemyPos):GetNormalized()
-							local lateralAngleFactor = 1.0 - math.abs(toEnemy:Dot(toCandidate))
-							local distToEnemy = (enemyPos - groundPos):Length()
-
-							local score = (elevationVsEnemy * 1.5)
-								+ (lateralAngleFactor * 45)
-								+ (distToEnemy >= 350 and distToEnemy <= 850 and 35 or -15)
-								- ((groundPos - npcPos):Length() * 0.03)
+							local danger = NAPC.AreaGetDangerAtPos(groundPos, myFaction, cur, enemy)
+							local score = (isHidden and 85 or 15) + (dToEnemy * 0.04) - (danger * 20) - (dist * 0.02)
 
 							if score > bestScore then
 								bestScore = score
@@ -5028,11 +5084,74 @@ function NAPC.FindFunnelOverwatchPos(npc, enemy, allThreats)
 		end
 	end
 
+	npc.CachedRetreatTime_NAPC = cur
+	npc.CachedRetreatPos_NAPC = bestPos
+	npc.CachedRetreatEnemy_NAPC = enemy
+	npc.CachedRetreatOrigin_NAPC = npcPos
+
 	return bestPos
 end
 
+local NAPC_ObsMeta = {
+	__index = function(t, k)
+		local npc = t._npc
+		local enemy = t._enemy
+		if not IsValid(npc) or not IsValid(enemy) then
+			return nil
+		end
+
+		local val = nil
+		if k == "bestCoverShootPos" then
+			val = NAPC.FindCoverShootingPos(npc, enemy, t.allThreats, 380, 1250)
+		elseif k == "advanceCoverPos" then
+			if t.enemyDist > 450 then
+				val = NAPC.FindCoverShootingPos(npc, enemy, t.allThreats, 350, math.max(380, t.enemyDist - 150))
+			end
+		elseif k == "counterHighGroundPos" then
+			if t.enemyHasHighGround or t.isElevationStalemate then
+				val = NAPC.FindCounterHighGroundPos(npc, enemy, t.allThreats)
+			end
+		elseif k == "highGroundPos" then
+			val = t.counterHighGroundPos or NAPC.FindHighGroundRear(npc, enemy, 48, nil, t.allThreats)
+		elseif k == "kiteRetreatPos" then
+			if t.isZombieOrHeadcrab or t.zombieTooClose then
+				val = NAPC.FindKiteRetreatPos(npc, enemy, t.allThreats, 450, 850)
+			end
+		elseif k == "shelterCoverPos" then
+			if t.flyerThreat or t.enemyIsFlyer or (t.enemyElevationDelta > 150 and t.enemyDist < 1200) then
+				val = NAPC.FindShelterCoverPos(npc, enemy, t.allThreats)
+			end
+		elseif k == "enfiladeAdvantagePos" then
+			val = NAPC.FindEnfiladeVantagePos(npc, enemy, t.allThreats)
+		elseif k == "keyAreaPos" then
+			val = NAPC.FindKeyTacticalArea(npc, enemy, t.groupCenter)
+		elseif k == "medicRetreatPos" then
+			if t.nearestMedic and (t.healthRatio < 0.60 or t.isTakingHeavyDPS) then
+				val = NAPC.FindMedicRetreatPos(npc, t.nearestMedic, enemy)
+			end
+		elseif k == "lureRetreatPos" then
+			val = NAPC.FindLureRetreatPos(npc, enemy, t.allThreats)
+		elseif k == "retreatPos" then
+			val = NAPC.FindRetreatPos(npc, enemy, t.allThreats)
+		elseif k == "flankPath" then
+			val = NAPC.FindFlankPath(npc, enemy, t.allThreats)
+		elseif k == "flankPos" then
+			val = t.flankPath and t.flankPath[#t.flankPath] or NAPC.FindFlankPos(npc, enemy, t.allThreats)
+		end
+
+		rawset(t, k, val)
+		return val
+	end,
+}
+
 function NAPC.OODA_Observe(npc, enemy, weapon)
-	local obs = {}
+	local obs = {
+		_npc = npc,
+		_enemy = enemy,
+		_weapon = weapon,
+	}
+	setmetatable(obs, NAPC_ObsMeta)
+
 	local npcPos = npc:GetPos()
 	local enemyPos = enemy:GetPos()
 	local maxHp = math.max(1, npc:GetMaxHealth())
@@ -5062,8 +5181,9 @@ function NAPC.OODA_Observe(npc, enemy, weapon)
 	obs.hasHighGroundAdvantage = (obs.enemyElevationDelta < -60)
 
 	obs.enemyIsFlyer = NAPC.IsFlyingOrHovering(enemy)
-	local timeSinceFlyerDmg = cur - (npc.LastFlyerDamageTime_NAPC or 0)
-	obs.flyerDamagedUs = (obs.enemyIsFlyer or IsValid(npc.LastFlyerAttacker_NAPC)) and (timeSinceFlyerDmg < 12.0)
+	local hasFlyerDamage = (npc.LastFlyerDamageTime_NAPC ~= nil) and ((cur - npc.LastFlyerDamageTime_NAPC) < 15.0)
+	obs.flyerThreat = obs.enemyIsFlyer or hasFlyerDamage or IsValid(npc.LastFlyerAttacker_NAPC)
+	obs.flyerDamagedUs = obs.flyerThreat
 
 	NAPC.OODA_UpdateEnemyProfile(npc, enemy, obs)
 
@@ -5250,39 +5370,11 @@ function NAPC.OODA_Observe(npc, enemy, weapon)
 	local myFaction = NAPC.AreaGetFactionOf(npc)
 	obs.currentPosDanger = NAPC.AreaGetDangerAtPos(npcPos, myFaction, cur, enemy)
 	obs.recentCasualties = NAPC.GetRecentCasualtiesNear(npc, npcPos, 1800, 12)
-	obs.isNearLethalZone = NAPC.IsPosNearLethalDanger(npcPos, 64) or (obs.currentPosDanger >= 2.5)
+	obs.isNearLethalZone = NAPC.IsPosNearLethalDanger(npcPos, 64) or (obs.currentPosDanger >= 2.2)
 
 	obs.targetCanShootBack = NAPC.CanShootBack(enemy) and not obs.isZombieOrHeadcrab
 	obs.isUnderFire = (timeSinceDmg < 1.5) or (obs.threatsAimingAtMe >= 1 and obs.seeEnemy)
 	obs.inCrossfire = obs.isPincered or (obs.threatsAimingAtMe >= 2) or (obs.isUnderFire and threatCount >= 2)
-
-	obs.bestCoverShootPos = NAPC.FindCoverShootingPos(npc, enemy, obs.allThreats, 380, 1250)
-
-	if obs.enemyHasHighGround or obs.hasHighGroundAdvantage then
-		obs.highGroundPos = NAPC.FindCounterHighGroundPos(npc, enemy, obs.allThreats)
-		obs.counterHighGroundPos = obs.highGroundPos
-	end
-
-	if obs.isZombieOrHeadcrab or obs.zombieTooClose then
-		obs.kiteRetreatPos = NAPC.FindKiteRetreatPos(npc, enemy, obs.allThreats, 450, 850)
-	end
-	if obs.flyerDamagedUs then
-		obs.shelterCoverPos = NAPC.FindShelterCoverPos(npc, enemy, obs.allThreats)
-	end
-	if obs.enemyTurnedAway or obs.squadTargetingSame >= 1 then
-		obs.enfiladeAdvantagePos = NAPC.FindEnfiladeVantagePos(npc, enemy, obs.allThreats)
-	end
-	if obs.nearestMedic and (obs.healthRatio < 0.60 or obs.isTakingHeavyDPS) then
-		obs.medicRetreatPos = NAPC.FindMedicRetreatPos(npc, obs.nearestMedic, enemy)
-	end
-
-	local enemyProf = (ooda and ooda.EnemyProfile) and ooda.EnemyProfile[enemy:EntIndex()] or nil
-	if obs.isZombieOrHeadcrab or obs.zombieTooClose or (enemyProf and enemyProf.isRusher and obs.squadCount >= 1) then
-		obs.lureRetreatPos = NAPC.FindLureRetreatPos(npc, enemy, obs.allThreats)
-	end
-
-	obs.flankPath = NAPC.FindFlankPath(npc, enemy, obs.allThreats)
-	obs.flankPos = obs.flankPath and obs.flankPath[#obs.flankPath] or NAPC.FindFlankPos(npc, enemy, obs.allThreats)
 
 	return obs
 end
@@ -5304,7 +5396,7 @@ function NAPC.OODA_Orient(npc, obs)
 
 	orient.isZombieEnemy = obs.isZombieOrHeadcrab or false
 	orient.zombieTooClose = obs.zombieTooClose or false
-	orient.flyerDamagedUs = obs.flyerDamagedUs or false
+	orient.flyerDamagedUs = obs.flyerThreat or obs.flyerDamagedUs or false
 	orient.isRPGThreat = obs.enemyHasRPG or false
 
 	local threat = 1
@@ -5353,7 +5445,6 @@ function NAPC.OODA_Orient(npc, obs)
 	orient.isOutgunned = (obs.enemyFirepower > obs.friendlyFirepower * 1.05)
 
 	local preserveThreshold = isCivilian and 0.85 or (isCitizen and 0.55 or (isMetro and 0.45 or 0.35))
-	local isExposedUnderFire = obs.isUnderFire and not obs.bestCoverShootPos
 	local isAimedAtUnprotected = (obs.enemyAimingAtMe or obs.threatsAimingAtMe >= 1)
 		and (obs.healthRatio < 0.50 or obs.isTakingHeavyDPS)
 
@@ -5362,7 +5453,6 @@ function NAPC.OODA_Orient(npc, obs)
 		or obs.isTakingHeavyDPS
 		or (orient.isIsolated and orient.isOutgunned)
 		or orient.zombieTooClose
-		or isExposedUnderFire
 		or isAimedAtUnprotected
 		or (obs.currentPosDanger >= 2.2)
 		or (obs.enemyDist < 260 and not orient.isZombieEnemy)
@@ -5374,20 +5464,22 @@ function NAPC.OODA_Orient(npc, obs)
 	orient.failedFlanks = ooda.FailedFlankAttempts or 0
 	orient.tacticalScores = ooda.TacticalScores or {}
 
-	orient.canHoldHighGround = obs.hasHighGroundAdvantage and not orient.shouldPreserveSelf and not obs.inCrossfire
+	orient.canHoldHighGround = (obs.hasHighGroundAdvantage or (obs.enemyElevationDelta < -40))
+		and not orient.shouldPreserveSelf
+		and not obs.inCrossfire
 	orient.canCounterHighGround = obs.enemyHasHighGround
-		and (obs.counterHighGroundPos ~= nil)
 		and not orient.shouldPreserveSelf
 		and not obs.enemyAimingAtMe
 		and not obs.inCrossfire
-
-	orient.canEnfilade = (obs.enfiladeAdvantagePos ~= nil) and not obs.enemyAimingAtMe and (obs.enemyDist >= 420)
-	orient.canAdvance = false
+	orient.canEnfilade = (obs.enemyDist >= 420) and not obs.enemyAimingAtMe and not orient.shouldPreserveSelf
+	orient.canAdvance = (obs.enemyDist > 450)
+		and not orient.shouldPreserveSelf
+		and not obs.inCrossfire
+		and not orient.isZombieEnemy
 
 	local flankScore = orient.tacticalScores["FLANK_MANEUVER"] or 0
 	orient.canFlank = (orient.failedFlanks < 3)
 		and (flankScore > -1.5)
-		and (obs.flankPos ~= nil)
 		and (obs.enemyDist >= 500 and obs.enemyDist <= 1800)
 		and not orient.shouldPreserveSelf
 		and not obs.inCrossfire
@@ -5418,6 +5510,36 @@ function NAPC.OODA_GenerateCandidateMoves(npc, obs, orient)
 		end
 	end
 
+	if orient.isZombieEnemy or obs.zombieTooClose then
+		Nominate("KITE_RETREAT")
+		if obs.squadCount >= 1 then
+			Nominate("BAIT_RETREAT")
+		end
+	end
+
+	if orient.enemyIsRusher or (obs.squadCount >= 1 and obs.enemyDist < 500) then
+		Nominate("BAIT_RETREAT")
+	end
+
+	if orient.shouldPreserveSelf or obs.ammoLack or (orient.isIsolated and orient.isOutgunned) then
+		if obs.nearestMedic and (obs.healthRatio < 0.60 or obs.isTakingHeavyDPS) then
+			Nominate("MEDIC_RETREAT")
+		end
+		Nominate("INDIVIDUAL_RETREAT")
+		Nominate("TAKE_COVER_SHOOTING_POS")
+	end
+
+	if obs.inCrossfire or obs.isNearLethalZone or obs.isPincered then
+		Nominate("BREAK_CROSSFIRE")
+		Nominate("INDIVIDUAL_RETREAT")
+		Nominate("TAKE_COVER_SHOOTING_POS")
+	end
+
+	if orient.groupBroken then
+		Nominate("GROUP_ROUT")
+		Nominate("INDIVIDUAL_RETREAT")
+	end
+
 	if orient.canCounterHighGround then
 		Nominate("COUNTER_HIGH_GROUND")
 	end
@@ -5426,34 +5548,7 @@ function NAPC.OODA_GenerateCandidateMoves(npc, obs, orient)
 		Nominate("HIGH_GROUND_REINFORCE")
 	end
 
-	if orient.isZombieEnemy or obs.zombieTooClose then
-		Nominate("KITE_RETREAT")
-		if obs.lureRetreatPos and obs.squadCount >= 1 then
-			Nominate("BAIT_RETREAT")
-		end
-	end
-
-	if orient.enemyIsRusher and obs.squadCount >= 1 and obs.lureRetreatPos then
-		Nominate("BAIT_RETREAT")
-	end
-
-	if orient.shouldPreserveSelf or obs.ammoLack or (orient.isIsolated and orient.isOutgunned) then
-		if obs.medicRetreatPos then
-			Nominate("MEDIC_RETREAT")
-		end
-		Nominate("TAKE_COVER_SHOOTING_POS")
-		Nominate("INDIVIDUAL_RETREAT")
-	end
-
-	if obs.inCrossfire or obs.isNearLethalZone or obs.isPincered then
-		Nominate("BREAK_CROSSFIRE")
-		Nominate("TAKE_COVER_SHOOTING_POS")
-		Nominate("INDIVIDUAL_RETREAT")
-	end
-
-	if obs.bestCoverShootPos then
-		Nominate("TAKE_COVER_SHOOTING_POS")
-	end
+	Nominate("TAKE_COVER_SHOOTING_POS")
 
 	if orient.canEnfilade then
 		Nominate("EXPLOIT_ENFILADE")
@@ -5464,13 +5559,29 @@ function NAPC.OODA_GenerateCandidateMoves(npc, obs, orient)
 		Nominate("FLANK_MANEUVER")
 	end
 
-	if orient.groupBroken then
-		Nominate("GROUP_ROUT")
-		Nominate("INDIVIDUAL_RETREAT")
+	if
+		(orient.squadRole == "SQUAD_ROLE_SECURE" or obs.squadCount >= 2)
+		and not orient.shouldPreserveSelf
+		and not obs.inCrossfire
+	then
+		Nominate("SECURE_KEY_AREA")
 	end
 
-	if orient.flyerDamagedUs and obs.shelterCoverPos then
+	if orient.flyerDamagedUs or obs.enemyIsFlyer or (obs.enemyElevationDelta > 150) then
 		Nominate("SHELTERED_WARFARE")
+	end
+
+	if
+		orient.canAdvance
+		and (
+			orient.hasCoveringFire
+			or orient.enemyVulnerable
+			or obs.isLongRangeStagnant
+			or obs.isElevationStalemate
+			or (obs.friendlyFirepower > obs.enemyFirepower * 1.3)
+		)
+	then
+		Nominate("SQUAD_BOUNDING_ADVANCE")
 	end
 
 	Nominate("HOLD_AND_ATTACK")
@@ -5514,10 +5625,21 @@ function NAPC.OODA_PredictEnemyCounter(obs, orient, candidateMove)
 	end
 
 	if candidateMove == "SQUAD_BOUNDING_ADVANCE" or candidateMove == "SQUAD_ADVANCE_CLOSER" then
-		counter.expectedAction = "ENEMY_CROSSHAIR_PUNISH"
-		counter.punishSeverity = 200
-		counter.threatMulti = 5.0
-		return counter
+		if orient.hasCoveringFire or obs.enemyReloading or obs.enemyTurnedAway then
+			counter.expectedAction = "ENEMY_PINNED_ADVANCE_UNCHECKED"
+			counter.threatMulti = 0.25
+			counter.exploitWindow = true
+			return counter
+		elseif obs.enemyAimingAtMe and obs.seeEnemy then
+			counter.expectedAction = "ENEMY_CROSSHAIR_PUNISH"
+			counter.punishSeverity = 50
+			counter.threatMulti = 2.0
+			return counter
+		else
+			counter.expectedAction = "ENEMY_SURPRISED_BY_PUSH"
+			counter.threatMulti = 0.65
+			return counter
+		end
 	end
 
 	if obs.enemyReloading then
@@ -5534,7 +5656,7 @@ function NAPC.OODA_PredictEnemyCounter(obs, orient, candidateMove)
 		return counter
 	end
 
-	if orient.flyerDamagedUs then
+	if orient.flyerDamagedUs or obs.enemyIsFlyer then
 		if candidateMove == "SHELTERED_WARFARE" then
 			counter.expectedAction = "FLYER_AERIAL_STRAFE_OBSTRUCTED"
 			counter.threatMulti = 0.20
@@ -5599,7 +5721,10 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 	local isZombie = orient.isZombieEnemy
 
 	if candidateMove == "HIGH_GROUND_REINFORCE" then
-		if obs.hasHighGroundAdvantage and not orient.shouldPreserveSelf then
+		if
+			(obs.hasHighGroundAdvantage or (orient.canHoldHighGround and obs.highGroundPos))
+			and not orient.shouldPreserveSelf
+		then
 			positionalControl = positionalControl + 35
 			expectedDmgDealt = (obs.friendlyFirepower or 1) * 24 * aggressionBias
 			expectedDmgTaken = (obs.enemyFirepower or 1) * 2.5
@@ -5607,7 +5732,12 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 			positionalControl = positionalControl - 40
 		end
 	elseif candidateMove == "COUNTER_HIGH_GROUND" then
-		if obs.counterHighGroundPos and not orient.shouldPreserveSelf and not obs.enemyAimingAtMe then
+		if
+			orient.canCounterHighGround
+			and obs.counterHighGroundPos
+			and not orient.shouldPreserveSelf
+			and not obs.enemyAimingAtMe
+		then
 			positionalControl = positionalControl + 40
 			expectedDmgDealt = (obs.friendlyFirepower or 1) * 26 * aggressionBias
 			expectedDmgTaken = (obs.enemyFirepower or 1) * 3.0
@@ -5615,7 +5745,13 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 			positionalControl = positionalControl - 45
 		end
 	elseif candidateMove == "EXPLOIT_ENFILADE" then
-		if obs.enfiladeAdvantagePos and (obs.enemyDist >= 420) and not obs.enemyAimingAtMe then
+		if
+			orient.canEnfilade
+			and obs.enfiladeAdvantagePos
+			and (obs.enemyDist >= 420)
+			and not obs.enemyAimingAtMe
+			and not orient.shouldPreserveSelf
+		then
 			positionalControl = positionalControl + 45
 			expectedDmgDealt = (obs.friendlyFirepower or 1) * 36 * aggressionBias
 			expectedDmgTaken = (obs.enemyFirepower or 1) * 2.0 * enemyCounter.threatMulti
@@ -5624,11 +5760,13 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 		end
 	elseif candidateMove == "TAKE_COVER_SHOOTING_POS" then
 		if obs.bestCoverShootPos then
-			local flyerPenalty = orient.flyerDamagedUs and 45 or 0
-			positionalControl = positionalControl + (40 - flyerPenalty)
-			expectedDmgTaken = ((obs.enemyFirepower or 1) * (orient.flyerDamagedUs and 3.0 or 1.0))
-				* enemyCounter.threatMulti
-			if obs.canAttack and not orient.flyerDamagedUs then
+			local flyerPenalty = (orient.flyerDamagedUs or obs.enemyIsFlyer) and 45 or 0
+			local preservePenalty = orient.shouldPreserveSelf and 35 or 0
+			positionalControl = positionalControl + (40 - flyerPenalty - preservePenalty)
+			expectedDmgTaken = (
+				(obs.enemyFirepower or 1) * ((orient.flyerDamagedUs or obs.enemyIsFlyer) and 3.0 or 1.0)
+			) * enemyCounter.threatMulti
+			if obs.canAttack and not (orient.flyerDamagedUs or obs.enemyIsFlyer) and not orient.shouldPreserveSelf then
 				expectedDmgDealt = (obs.friendlyFirepower or 1) * 24 * (obs.hasHighGroundAdvantage and 1.15 or 1.0)
 			end
 		else
@@ -5647,18 +5785,43 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 			positionalControl = positionalControl - 45
 		end
 	elseif candidateMove == "MEDIC_RETREAT" then
-		if obs.medicRetreatPos then
-			positionalControl = positionalControl + 40
+		if obs.nearestMedic and obs.medicRetreatPos then
+			positionalControl = positionalControl + 45
 			expectedDmgTaken = 1.5
 			expectedDmgDealt = 0
 		else
 			positionalControl = positionalControl - 45
 		end
 	elseif candidateMove == "SHELTERED_WARFARE" then
-		if obs.shelterCoverPos then
-			positionalControl = positionalControl + 50
-			expectedDmgTaken = ((obs.enemyFirepower or 1) * 0.8) * enemyCounter.threatMulti
-			expectedDmgDealt = (obs.friendlyFirepower or 1) * 22 * aggressionBias
+		if (orient.flyerDamagedUs or obs.enemyIsFlyer or obs.enemyElevationDelta > 150) and obs.shelterCoverPos then
+			positionalControl = positionalControl + 55
+			expectedDmgTaken = ((obs.enemyFirepower or 1) * 0.7) * enemyCounter.threatMulti
+			expectedDmgDealt = (obs.friendlyFirepower or 1) * 24 * aggressionBias
+		else
+			positionalControl = positionalControl - 45
+		end
+	elseif candidateMove == "SQUAD_BOUNDING_ADVANCE" or candidateMove == "SQUAD_ADVANCE_CLOSER" then
+		if orient.canAdvance and obs.advanceCoverPos and not orient.shouldPreserveSelf and not isZombie then
+			local coveringBonus = orient.hasCoveringFire and 30 or 0
+			local vulnerableBonus = orient.enemyVulnerable and 25 or 0
+			local stagnantBonus = (obs.isLongRangeStagnant or obs.isElevationStalemate) and 20 or 0
+			positionalControl = positionalControl + 35 + coveringBonus + vulnerableBonus + stagnantBonus
+			expectedDmgDealt = (obs.friendlyFirepower or 1) * 32 * aggressionBias
+			expectedDmgTaken = (obs.enemyFirepower or 1) * 3.5 * enemyCounter.threatMulti
+		else
+			positionalControl = positionalControl - 50
+		end
+	elseif candidateMove == "SECURE_KEY_AREA" then
+		if
+			(orient.squadRole == "SQUAD_ROLE_SECURE" or obs.squadCount >= 2)
+			and obs.keyAreaPos
+			and not orient.shouldPreserveSelf
+			and not isZombie
+		then
+			local roleBonus = (orient.squadRole == "SQUAD_ROLE_SECURE") and 35 or 15
+			positionalControl = positionalControl + 35 + roleBonus
+			expectedDmgDealt = (obs.friendlyFirepower or 1) * 26 * aggressionBias
+			expectedDmgTaken = (obs.enemyFirepower or 1) * 3.0 * enemyCounter.threatMulti
 		else
 			positionalControl = positionalControl - 45
 		end
@@ -5667,6 +5830,9 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 			positionalControl = positionalControl - 60
 			expectedDmgDealt = (obs.friendlyFirepower or 1) * 8
 			expectedDmgTaken = 35
+		elseif orient.shouldPreserveSelf then
+			positionalControl = positionalControl - 65
+			expectedDmgTaken = (obs.enemyFirepower or 1) * 30
 		elseif obs.enemyDist < 380 and not isZombie then
 			positionalControl = positionalControl - 45
 			expectedDmgTaken = (obs.enemyFirepower or 1) * 25
@@ -5687,20 +5853,20 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 		end
 	elseif candidateMove == "BAIT_RETREAT" then
 		if (isZombie or orient.enemyIsRusher) and (obs.squadCount or 0) >= 1 and obs.lureRetreatPos then
-			positionalControl = positionalControl + 25
-			expectedDmgTaken = (obs.enemyFirepower or 1) * 3.0
-			expectedDmgDealt = (obs.friendlyFirepower or 1) * 12 * aggressionBias
+			positionalControl = positionalControl + 30
+			expectedDmgTaken = (obs.enemyFirepower or 1) * 2.5
+			expectedDmgDealt = (obs.friendlyFirepower or 1) * 14 * aggressionBias
 		elseif isZombie and obs.lureRetreatPos then
-			positionalControl = positionalControl + 15
+			positionalControl = positionalControl + 20
 			expectedDmgTaken = 2.0
-			expectedDmgDealt = (obs.friendlyFirepower or 1) * 8
+			expectedDmgDealt = (obs.friendlyFirepower or 1) * 10
 		else
 			positionalControl = positionalControl - 55
 			expectedDmgTaken = (obs.enemyFirepower or 1) * 15
 			expectedDmgDealt = 0
 		end
 	elseif candidateMove == "FLANK_MANEUVER" or candidateMove == "SQUAD_COORDINATED_FLANK" then
-		if not orient.canFlank then
+		if not orient.canFlank or orient.shouldPreserveSelf then
 			positionalControl = positionalControl - 60
 		elseif obs.enemyAimingAtMe and not orient.hasCoveringFire then
 			positionalControl = positionalControl - 65
@@ -5713,7 +5879,7 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 			positionalControl = positionalControl - 45
 		end
 	elseif candidateMove == "SUPPRESSIVE_FIRE" then
-		if obs.canAttack and obs.seeEnemy then
+		if obs.canAttack and obs.seeEnemy and not orient.shouldPreserveSelf then
 			expectedDmgDealt = (obs.friendlyFirepower or 1) * 20
 			expectedDmgTaken = (obs.enemyFirepower or 1) * 6
 			positionalControl = positionalControl
@@ -5731,26 +5897,29 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 		end
 	elseif candidateMove == "INDIVIDUAL_RETREAT" or candidateMove == "GROUP_ROUT" then
 		if orient.shouldPreserveSelf or orient.groupBroken or (isIsolated and orient.isOutgunned) then
-			positionalControl = positionalControl + 35
-			expectedDmgTaken = 2.5
+			positionalControl = positionalControl + 60
+			expectedDmgTaken = 1.0
+			expectedDmgDealt = 0
 		else
-			positionalControl = positionalControl - 45
+			positionalControl = positionalControl - 50
 		end
 	elseif candidateMove == "REPOSITION_LOF" then
-		if not obs.seeEnemy then
-			positionalControl = positionalControl + 15
+		if not obs.seeEnemy and not orient.shouldPreserveSelf then
+			positionalControl = positionalControl + 20
 		else
-			positionalControl = positionalControl - 25
+			positionalControl = positionalControl - 35
 		end
 	end
 
-	if obs.hasHighGroundAdvantage then
+	if obs.hasHighGroundAdvantage and not orient.shouldPreserveSelf then
 		positionalControl = positionalControl + 12
 		expectedDmgDealt = expectedDmgDealt * 1.15
 		expectedDmgTaken = expectedDmgTaken * 0.85
 	end
 
-	local inertiaBonus = (ooda and ooda.LastDecision == candidateMove and candidateMove ~= "NONE") and 8 or 0
+	local inertiaBonus = (ooda and ooda.LastDecision == candidateMove and candidateMove ~= "NONE")
+			and ((candidateMove == "INDIVIDUAL_RETREAT" or candidateMove == "GROUP_ROUT") and 18 or 8)
+		or 0
 
 	local totalExpectedUtility = (expectedDmgDealt * 1.2)
 		- (expectedDmgTaken * 2.8)
@@ -5896,6 +6065,32 @@ function NAPC.OODA_Act(npc, decision, obs, orient, NPCClass, weapon)
 		then
 			npc:SetSchedule(SCHED_RANGE_ATTACK1)
 		end
+	elseif decision == "SQUAD_BOUNDING_ADVANCE" or decision == "SQUAD_ADVANCE_CLOSER" then
+		if IsValid(enemy) and not isMoving and not ooda.ActionApplied then
+			local targetPos = obs.advanceCoverPos or obs.bestCoverShootPos
+			local speed = isCitizen and math.Rand(1.35, 1.5) or 1.45
+			NAPC.OODA_DispatchMove(npc, ooda, targetPos, SCHED_ESTABLISH_LINE_OF_FIRE, speed, 2.8)
+		elseif
+			not isMoving
+			and obs.canAttack
+			and curSched ~= SCHED_RANGE_ATTACK1
+			and not NAPC.Tables.ActiveCombatSchedules[curSched]
+		then
+			npc:SetSchedule(SCHED_RANGE_ATTACK1)
+		end
+	elseif decision == "SECURE_KEY_AREA" then
+		if IsValid(enemy) and not isMoving and not ooda.ActionApplied then
+			local targetPos = obs.keyAreaPos or obs.bestCoverShootPos
+			local speed = isCitizen and math.Rand(1.35, 1.45) or 1.4
+			NAPC.OODA_DispatchMove(npc, ooda, targetPos, SCHED_TAKE_COVER_FROM_ENEMY, speed, 3.2)
+		elseif
+			not isMoving
+			and obs.canAttack
+			and curSched ~= SCHED_RANGE_ATTACK1
+			and not NAPC.Tables.ActiveCombatSchedules[curSched]
+		then
+			npc:SetSchedule(SCHED_RANGE_ATTACK1)
+		end
 	elseif decision == "MEDIC_RETREAT" then
 		if NPCClass == "npc_combine_s" and NAPC.ConvarsBool["NAPC_Combine_Cloaking"] then
 			NAPC.UseCloaking(npc)
@@ -5978,10 +6173,43 @@ function NAPC.OODA_Act(npc, decision, obs, orient, NPCClass, weapon)
 			NAPC.UseCloaking(npc)
 		end
 		if IsValid(enemy) and not isMoving and not ooda.ActionApplied then
-			local targetPos = IsValid(obs.healthiestMate)
-					and NAPC.FindCoverBehindReinforcer(npc, obs.healthiestMate, enemy:GetPos(), enemy, obs.allThreats)
-				or (npc:GetPos() - ((enemy:GetPos() - npc:GetPos()):GetNormalized() * math.Rand(450, 750)))
-			NAPC.OODA_DispatchMove(npc, ooda, targetPos, SCHED_TAKE_COVER_FROM_ENEMY, 1.5, 2.5)
+			local targetPos = obs.retreatPos
+				or (IsValid(obs.healthiestMate) and NAPC.FindCoverBehindReinforcer(
+					npc,
+					obs.healthiestMate,
+					enemy:GetPos(),
+					enemy,
+					obs.allThreats
+				))
+				or (npc:GetPos() - ((enemy:GetPos() - npc:GetPos()):GetNormalized() * math.Rand(600, 950)))
+			NAPC.OODA_DispatchMove(npc, ooda, targetPos, SCHED_RUN_FROM_ENEMY_FALLBACK, 1.55, 3.5)
+		elseif not isMoving then
+			NAPC.Tick_MovementSpeed(npc, 1.0)
+			if not obs.seeEnemy then
+				if curSched ~= SCHED_AMBUSH and not NAPC.Tables.BannedSchedule_List2[curSched] then
+					if obs.ammoLack then
+						npc:SetSchedule(SCHED_HIDE_AND_RELOAD)
+					else
+						npc:SetSchedule(SCHED_AMBUSH)
+					end
+				end
+			else
+				if (obs.enemyDist < 450 or obs.isUnderFire) and obs.retreatPos then
+					local distToRetreatSqr = (obs.retreatPos - npc:GetPos()):LengthSqr()
+					if distToRetreatSqr > 25600 then
+						ooda.ActionApplied = false
+						NAPC.OODA_DispatchMove(npc, ooda, obs.retreatPos, SCHED_RUN_FROM_ENEMY_FALLBACK, 1.55, 3.0)
+					elseif curSched ~= SCHED_RUN_FROM_ENEMY_FALLBACK and curSched ~= SCHED_TAKE_COVER_FROM_ENEMY then
+						npc:SetSchedule(SCHED_TAKE_COVER_FROM_ENEMY)
+					end
+				elseif
+					obs.canAttack
+					and curSched ~= SCHED_RANGE_ATTACK1
+					and not NAPC.Tables.ActiveCombatSchedules[curSched]
+				then
+					npc:SetSchedule(SCHED_RANGE_ATTACK1)
+				end
+			end
 		end
 	elseif decision == "SUPPRESSIVE_FIRE" then
 		if npc.ForcedGoPos_NAPC then
@@ -6041,59 +6269,83 @@ function NAPC.OODA_Act(npc, decision, obs, orient, NPCClass, weapon)
 			end
 		end
 	elseif decision == "REPOSITION_LOF" then
-		if curSched ~= SCHED_ESTABLISH_LINE_OF_FIRE and not NAPC.Tables.ActiveCombatSchedules[curSched] then
+		if not isMoving and not ooda.ActionApplied and obs.bestCoverShootPos then
+			NAPC.OODA_DispatchMove(npc, ooda, obs.bestCoverShootPos, SCHED_ESTABLISH_LINE_OF_FIRE, 1.35, 2.5)
+		elseif curSched ~= SCHED_ESTABLISH_LINE_OF_FIRE and not NAPC.Tables.ActiveCombatSchedules[curSched] then
 			npc:SetSchedule(SCHED_ESTABLISH_LINE_OF_FIRE)
 		end
 	end
 end
 
-function NAPC.CECA_Critique(npc, concept, info)
-	local needs = {}
+function NAPC.CECA_FormulateConceptualModel(npc, info, enemy)
+	local ceca = npc.CECA
+	local concept = ceca.ConceptualModel or {}
+	local powerRatio = info.friendlyFirepower / math.max(0.1, info.enemyFirepower)
+	local isIsolated = (info.squadCount == 0)
+	local isOutgunned = (powerRatio < 0.95)
 
-	if concept.RequiresStandoff or info.zombieTooClose or concept.DesiredState == "MELEE_STANDOFF_KITING" then
-		needs["NEED_KITE_POS"] = true
-	end
-
-	if
-		concept.DesiredState == "OVERWHELM_OVERPOWERED_ENEMY"
-		or info.enemyCritical
-		or concept.DesiredState == "BREAK_LONG_RANGE_STAGNATION"
+	if info.isZombieOrHeadcrab then
+		if info.enemyDist < 550 or info.zombieTooClose then
+			concept.DesiredState = "MELEE_STANDOFF_KITING"
+			concept.IdealRange = 650
+			concept.RequiresStandoff = true
+			concept.RequiresHighGround = false
+		else
+			concept.DesiredState = "RANGED_FIRE_SUPERIORITY_ZOMBIE"
+			concept.IdealRange = 600
+			concept.RequiresStandoff = false
+		end
+	elseif info.inCrossfire or info.isNearLethalZone or info.isTakingHeavyDPS then
+		concept.DesiredState = "EXTRICATE_CROSSFIRE"
+		concept.RequiresCrossfireBreak = true
+		concept.RequiresCover = true
+	elseif
+		info.healthRatio < 0.65
+		or (isIsolated and isOutgunned)
+		or info.enemyAimingAtMe
+		or (info.enemyDist < 400)
 	then
-		needs["NEED_ADVANCE_COVER"] = true
+		concept.DesiredState = "PRESERVE_AND_REARM"
+		concept.RequiresCover = true
+	elseif info.flyerThreat or info.enemyIsFlyer or (info.enemyElevationDelta > 150) then
+		concept.DesiredState = "OVERHEAD_SHELTER_ENGAGEMENT"
+		concept.RequiresOverheadCover = true
+		concept.RequiresHighGround = false
+	elseif
+		info.enemyHasHighGround
+		and info.enemyElevationDelta > 80
+		and not info.enemyAimingAtMe
+		and info.healthRatio > 0.55
+	then
+		concept.DesiredState = "COUNTER_DOMINATE_HIGH_GROUND"
+		concept.RequiresHighGround = true
+		concept.RequiresCover = true
+	elseif
+		(info.theaterSquadData and info.theaterSquadData.role == "SQUAD_ROLE_SECURE")
+		or (info.squadCount >= 2 and powerRatio > 1.2)
+	then
+		concept.DesiredState = "SECURE_KEY_VANTAGE"
+		concept.RequiresCover = true
+	elseif
+		not isIsolated
+		and (info.theaterSquadData and info.theaterSquadData.role == "SQUAD_ROLE_FLANK" or powerRatio > 1.2)
+		and not info.enemyAimingAtMe
+	then
+		concept.DesiredState = "ENFILADE_CROSSFIRE"
+		concept.RequiresFlank = true
+	elseif not isIsolated and info.theaterSquadData and info.theaterSquadData.role == "SQUAD_ROLE_SUPPRESS" then
+		concept.DesiredState = "SUPPRESSIVE_LOCK"
+		concept.RequiresCover = true
+	elseif (info.hasCoveringFire or info.isLongRangeStagnant or info.isElevationStalemate) and not isIsolated then
+		concept.DesiredState = "BOUNDING_OVERWATCH_PUSH"
+		concept.RequiresCover = true
+	else
+		concept.DesiredState = "FIRE_SUPERIORITY"
+		concept.RequiresCover = true
 	end
 
-	if concept.DesiredState == "BREAK_ELEVATION_STALEMATE" or concept.RequiresFlank then
-		needs["NEED_ENFILADE_POS"] = true
-		needs["NEED_ADVANCE_COVER"] = true
-	end
-
-	if concept.RequiresOverheadCover or info.flyerDamagedUs then
-		needs["NEED_SHELTER_POS"] = true
-	end
-
-	if concept.RequiresHighGround or info.enemyHasHighGround or concept.DesiredState == "SEIZE_HIGH_GROUND_VANTAGE" then
-		needs["NEED_COUNTER_HIGH_GROUND"] = true
-		needs["NEED_HIGH_GROUND"] = true
-	end
-
-	if info.isZombieOrHeadcrab or (info.enemyIsRusher and (info.squadCount or 0) >= 1) then
-		needs["NEED_LURE_RETREAT"] = true
-	end
-
-	if concept.DesiredState == "ENFILADE_CROSSFIRE" or info.enemyTurnedAway or info.squadTargetingSame >= 1 then
-		needs["NEED_ENFILADE_POS"] = true
-	end
-
-	if concept.DesiredState == "PRESERVE_AND_REARM" and info.nearestMedic then
-		needs["NEED_MEDIC_ROUTE"] = true
-	end
-
-	if info.targetCanShootBack then
-		needs["NEED_COVER_SHOOT_POS"] = true
-		needs["NEED_ADVANCE_COVER"] = true
-	end
-
-	return needs
+	ceca.ConceptualModel = concept
+	return concept
 end
 
 function NAPC.CECA_Process(npc, NPCClass, weapon, enemy, curSched, NPCState, obs)
@@ -6105,34 +6357,24 @@ function NAPC.CECA_Process(npc, NPCClass, weapon, enemy, curSched, NPCState, obs
 	if NAPC.CurTime_Tick < (ceca.NextCECACycle or 0) then
 		return false
 	end
-	ceca.NextCECACycle = NAPC.CurTime_Tick + math.Rand(1.6, 2.6)
+	ceca.NextCECACycle = NAPC.CurTime_Tick + math.Rand(2.0, 3.2)
 
 	local sit = obs or NAPC.OODA_Observe(npc, enemy, weapon)
-
 	local concept = NAPC.CECA_FormulateConceptualModel(npc, sit, enemy)
-	local infoNeeds = NAPC.CECA_Critique(npc, concept, sit)
-
-	local exploreResults = NAPC.CECA_Explore(npc, enemy, sit, infoNeeds)
-	for k, v in pairs(exploreResults) do
-		sit[k] = v
-	end
-
 	ceca.SituationModel = sit
 
 	local strategicDirective = "HOLD_AND_ATTACK"
 	if sit.isZombieOrHeadcrab and (sit.enemyDist < 550 or sit.zombieTooClose) then
 		strategicDirective = "KITE_RETREAT"
 	elseif sit.shouldPreserveSelf or sit.ammoLack then
-		strategicDirective = sit.medicRetreatPos and "MEDIC_RETREAT" or "TAKE_COVER_SHOOTING_POS"
+		strategicDirective = sit.nearestMedic and "MEDIC_RETREAT" or "TAKE_COVER_SHOOTING_POS"
 	elseif sit.inCrossfire or sit.isNearLethalZone then
 		strategicDirective = "BREAK_CROSSFIRE"
-	elseif sit.enemyHasHighGround and sit.counterHighGroundPos then
+	elseif sit.enemyHasHighGround then
 		strategicDirective = "COUNTER_HIGH_GROUND"
-	elseif (sit.highGroundPos or sit.hasHighGroundAdvantage) and sit.enemyDist >= 400 then
+	elseif sit.hasHighGroundAdvantage and sit.enemyDist >= 400 then
 		strategicDirective = "HIGH_GROUND_REINFORCE"
-	elseif sit.enfiladeAdvantagePos and not sit.enemyAimingAtMe then
-		strategicDirective = "EXPLOIT_ENFILADE"
-	elseif sit.flyerDamagedUs and sit.shelterCoverPos then
+	elseif sit.flyerDamagedUs then
 		strategicDirective = "SHELTERED_WARFARE"
 	elseif sit.groupBroken then
 		strategicDirective = "GROUP_ROUT"
@@ -6433,9 +6675,24 @@ function NAPC.Tick_Jump(npc, NPCClass)
 end
 
 function NAPC.Tick_Shoot_SameTime(npc)
+	if not NAPC.ConvarsBool["NAPC_ATTACK_TOGETHER"] then
+		return
+	end
+
 	local wep = npc:GetActiveWeapon()
 	if IsValid(wep) and NAPC.IsRPGWeapon(wep) then
 		return
+	end
+
+	if npc.CanRangeAttack_NAPC and npc:GetNPCState() == NPC_STATE_COMBAT then
+		local curSched = npc:GetCurrentSchedule()
+		if
+			curSched ~= SCHED_RANGE_ATTACK1
+			and curSched ~= SCHED_RANGE_ATTACK2
+			and not NAPC.Tables.ActiveCombatSchedules[curSched]
+		then
+			npc:SetSchedule(SCHED_RANGE_ATTACK1)
+		end
 	end
 end
 
@@ -6748,6 +7005,65 @@ function NAPC.Bullet_ShotgunnerBullet(npc, NPCClass, enemypos, weapon, data)
 	end
 end
 
+function NAPC.CheckAR2BallClearance(npc, startPos, targetOrPos)
+	if not IsValid(npc) then
+		return false
+	end
+
+	local enemy = isentity(targetOrPos) and targetOrPos or npc:GetEnemy()
+	local targetEye = IsValid(enemy) and enemy:EyePos() or nil
+	local targetCenter = IsValid(enemy) and enemy:WorldSpaceCenter() or (isvector(targetOrPos) and targetOrPos or nil)
+
+	if not targetCenter then
+		return false
+	end
+
+	startPos = startPos or (npc:EyePos() + (npc:GetForward() * 20))
+	local dist = (targetCenter - startPos):Length()
+	if dist < 100 then
+		return false
+	end
+
+	local filter = { npc }
+	local wep = npc:GetActiveWeapon()
+	if IsValid(wep) then
+		filter[#filter + 1] = wep
+	end
+	if IsValid(enemy) then
+		filter[#filter + 1] = enemy
+	end
+
+	local trCenter = util.TraceLine({
+		start = startPos,
+		endpos = targetCenter,
+		mask = bit.bor(MASK_SOLID, CONTENTS_GRATE, CONTENTS_DEBRIS),
+		filter = filter,
+	})
+
+	if not trCenter.Hit then
+		return true
+	end
+
+	if targetEye then
+		local trEye = util.TraceLine({
+			start = startPos,
+			endpos = targetEye,
+			mask = bit.bor(MASK_SOLID, CONTENTS_GRATE, CONTENTS_DEBRIS),
+			filter = filter,
+		})
+
+		if not trEye.Hit then
+			return true
+		end
+	end
+
+	if (trCenter.HitPos - targetCenter):LengthSqr() <= 4096 then
+		return true
+	end
+
+	return false
+end
+
 function NAPC.Bullet_FireAR2Ball(npc, enemypos, weapon, data)
 	local canAltFire = NAPC.ConvarsBool["NAPC_NPCs_AR2_AltFire"]
 		or (NAPC.ConvarsBool["NAPC_Combine_AR2_AltFire"] and npc:GetClass() == "npc_combine_s")
@@ -6760,25 +7076,41 @@ function NAPC.Bullet_FireAR2Ball(npc, enemypos, weapon, data)
 
 	local nextAR2Ball = npc.NextFireAR2Ball_NAPC
 	if not nextAR2Ball then
-		npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(3, 9)
+		npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(3, 8)
 		return
 	end
 	if nextAR2Ball > NAPC.CurTime_Tick then
 		return
 	end
-	npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(8, 16)
 
+	local enemy = npc:GetEnemy()
+	local muzzlePos = data.Src or (npc:EyePos() + (npc:GetForward() * 20))
+	local target = IsValid(enemy) and enemy or enemypos
+
+	if not NAPC.CheckAR2BallClearance(npc, muzzlePos, target) then
+		npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(2, 4)
+		return
+	end
+
+	npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(8, 16)
+	npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(8, 16))
+
+	local targetPos = isvector(enemypos) and enemypos
+		or (IsValid(enemy) and enemy:WorldSpaceCenter() or (muzzlePos + npc:GetForward() * 500))
 	local ent = ents.Create("prop_combine_ball")
 	if not IsValid(ent) then
 		return
 	end
-	local aimVec = (enemypos - data.Src):GetNormalized()
+	local aimVec = (targetPos - muzzlePos):GetNormalized()
 	ent:SetOwner(npc)
-	ent:SetPos(data.Src + aimVec * 32)
+	ent:SetPos(muzzlePos + (aimVec * 32))
 	ent:Spawn()
 	ent:SetSaveValue("m_flRadius", 10)
 	ent:SetSaveValue("m_nState", 2)
-	ent:GetPhysicsObject():SetVelocity(aimVec * 1000)
+	local phys = ent:GetPhysicsObject()
+	if IsValid(phys) then
+		phys:SetVelocity(aimVec * 1000)
+	end
 	ent:EmitSound("NPC_CombineBall.Launch")
 	timer.Simple(math.Rand(2, 4), function()
 		if IsValid(ent) then
@@ -6934,10 +7266,15 @@ function NAPC.WakenStupidNPC(IsTickUse, npc, attacker, enemy, NPCClass, curSched
 		if seeEnemyTime + npc.Patience_NAPC * 1.2 < NAPC.CurTime_Tick then
 			npc:ClearSchedule()
 			if NPCClass == "npc_combine_s" then
-				if npc:GetInternalVariable("m_fIsElite") then
-					npc:SetSaveValue("m_vecAltFireTarget", npc:GetEnemyLastSeenPos(enemy))
+				local isElite = npc:GetInternalVariable("m_fIsElite")
+				local targetPos = npc:GetEnemyLastSeenPos(enemy)
+				local hasClearance = isElite and NAPC.CheckAR2BallClearance(npc, npc:EyePos(), enemy or targetPos)
+
+				if isElite and hasClearance then
+					npc:SetSaveValue("m_vecAltFireTarget", targetPos)
 					npc:SetActivity(ACT_COMBINE_AR2_ALTFIRE)
 				else
+					npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(4, 7))
 					npc:SetSaveValue("m_hForcedGrenadeTarget", enemy)
 				end
 			else
@@ -7073,7 +7410,7 @@ function NAPC.IsGrenadeBlastSafe(npc, blastPos, radius)
 	end
 
 	for _, ply in player.Iterator() do
-		if IsValid(ply) and ply:Alive() and NAPC.IsFriendly(npc, ply) then
+		if IsValid(ply) and ply:Alive() and not NAPC.IsPlayerIgnored(ply) and NAPC.IsFriendly(npc, ply) then
 			if (ply:GetPos() - blastPos):LengthSqr() <= rSqr then
 				return false
 			end
@@ -8017,14 +8354,25 @@ function NAPC.FindRPGAntiAirTarget(npc)
 		return nil
 	end
 
+	local cur = NAPC.CurTime_Tick
+	if NAPC.CachedAATargetTime and (cur - NAPC.CachedAATargetTime < 0.5) then
+		if
+			IsValid(NAPC.CachedAATarget)
+			and NAPC.CachedAATarget:Alive()
+			and not NAPC.IsFriendly(npc, NAPC.CachedAATarget)
+		then
+			return NAPC.CachedAATarget
+		end
+	end
+
 	local myPos = npc:GetPos()
 	local curEnemy = npc:GetEnemy()
 	local curEnemyValid = IsValid(curEnemy) and curEnemy:Alive() and not NAPC.IsFriendly(npc, curEnemy)
 
 	local bestTarget = nil
 	local bestScore = -math.huge
-
 	local candidates = {}
+
 	local airClasses = { "npc_gunship", "npc_helicopter", "npc_combinedropship" }
 	for i = 1, #airClasses do
 		local found = ents.FindByClass(airClasses[i])
@@ -8047,8 +8395,7 @@ function NAPC.FindRPGAntiAirTarget(npc)
 			local isFlyer = isMajorAir or NAPC.IsFlyingOrHovering(ent)
 
 			if isFlyer then
-				local hasDamagedMates = ent.LastDamagedMatesTime_NAPC
-					and (NAPC.CurTime_Tick - ent.LastDamagedMatesTime_NAPC <= 25)
+				local hasDamagedMates = ent.LastDamagedMatesTime_NAPC and (cur - ent.LastDamagedMatesTime_NAPC <= 25)
 
 				if isMajorAir or hasDamagedMates then
 					local distSqr = (ent:GetPos() - myPos):LengthSqr()
@@ -8088,6 +8435,9 @@ function NAPC.FindRPGAntiAirTarget(npc)
 			end
 		end
 	end
+
+	NAPC.CachedAATarget = bestTarget
+	NAPC.CachedAATargetTime = cur
 
 	return bestTarget
 end
@@ -8301,542 +8651,6 @@ function NAPC.HandleRPGFiring(npc, enemy, weapon, curSched)
 	end
 end
 
-function NAPC.CECA_InformationGathering(npc, enemy, weapon)
-	local info = {}
-	local npcPos = npc:GetPos()
-	local enemyPos = enemy:GetPos()
-	local maxHp = math.max(1, npc:GetMaxHealth())
-
-	info.healthRatio = npc:Health() / maxHp
-	info.ammoLack = npc:HasCondition(COND.LOW_PRIMARY_AMMO) or npc:HasCondition(COND.NO_PRIMARY_AMMO)
-	info.enemyDistSqr = (enemyPos - npcPos):LengthSqr()
-	info.enemyDist = math.sqrt(info.enemyDistSqr)
-	info.seeEnemy = npc:Visible(enemy)
-	info.canAttack = npc:HasCondition(COND.CAN_RANGE_ATTACK1)
-		or npc:HasCondition(COND.CAN_RANGE_ATTACK2)
-		or npc:HasCondition(COND.CAN_MELEE_ATTACK1)
-		or (info.seeEnemy and info.enemyDist < 450)
-	info.enemyHasRPG = NAPC.IsRocketLauncher(enemy:GetActiveWeapon())
-
-	info.isZombieOrHeadcrab = NAPC.IsZombieOrHeadcrab(enemy)
-	info.zombieTooClose = info.isZombieOrHeadcrab and (info.enemyDist < 550)
-
-	local enemyMaxHp = enemy.GetMaxHealth and enemy:GetMaxHealth() or 100
-	info.enemyHealthRatio = enemy:Health() / math.max(1, enemyMaxHp)
-	info.enemyCritical = (info.enemyHealthRatio <= 0.25) or (enemy:Health() <= 25)
-
-	info.enemyElevationDelta = enemyPos.z - npcPos.z
-	info.enemyHasHighGround = (info.enemyElevationDelta > 60)
-	info.hasHighGroundAdvantage = (info.enemyElevationDelta < -60)
-	info.enemyIsFlyer = NAPC.IsFlyingOrHovering(enemy)
-
-	local timeSinceFlyerDmg = NAPC.CurTime_Tick - (npc.LastFlyerDamageTime_NAPC or 0)
-	info.flyerDamagedUs = (info.enemyIsFlyer or IsValid(npc.LastFlyerAttacker_NAPC)) and (timeSinceFlyerDmg < 12.0)
-
-	NAPC.OODA_UpdateEnemyProfile(npc, enemy, info)
-
-	local timeSinceDmg = NAPC.CurTime_Tick - (npc.LastDamageTime_NAPC or 0)
-	if timeSinceDmg > 3.0 then
-		npc.DamageBuffer_NAPC = 0
-	end
-	info.rapidDmgTaken = npc.DamageBuffer_NAPC or 0
-	info.isTakingHeavyDPS = (info.rapidDmgTaken > maxHp * 0.22)
-
-	info.enemyIsPlayer = enemy:IsPlayer()
-	info.enemyAimingAtMe = false
-	info.enemyTurnedAway = false
-	info.enemyReloading = false
-
-	if not (info.enemyIsPlayer and NAPC.IsPlayerIgnored(enemy)) then
-		local enemyAimDir = enemy:GetAimVector()
-		local toMeFromEnemy = (npc:WorldSpaceCenter() - enemy:EyePos()):GetNormalized()
-		local aimDot = enemyAimDir:Dot(toMeFromEnemy)
-
-		if aimDot > 0.85 then
-			info.enemyAimingAtMe = true
-		elseif aimDot < 0.25 then
-			info.enemyTurnedAway = true
-		end
-
-		if info.enemyIsPlayer then
-			local plyWep = enemy:GetActiveWeapon()
-			if IsValid(plyWep) and plyWep.Clip1 and plyWep:Clip1() == 0 then
-				info.enemyReloading = true
-			end
-		elseif enemy.HasCondition then
-			info.enemyReloading = enemy:HasCondition(COND.LOW_PRIMARY_AMMO) or enemy:HasCondition(COND.NO_PRIMARY_AMMO)
-		end
-	end
-
-	info.allThreats = {}
-	info.threatsAimingAtMe = 0
-	info.incomingThreatCenter = Vector(0, 0, 0)
-	info.enemyFirepower = NAPC.GetFirepower(enemy)
-
-	info.squadMembers = {}
-	info.squadTargetingSame = 0
-	info.routedSquadMates = 0
-	info.healthiestMate = nil
-	info.nearestMedic = nil
-	local closestMedicDistSqr = math.huge
-	local highestMateHpRatio = 0.65
-
-	local groupPosSum = Vector(npcPos.x, npcPos.y, npcPos.z)
-	info.friendlyFirepower = NAPC.GetFirepower(npc)
-	local checkSquad = NAPC.ConvarsBool["NAPC_OODA_SquadTactics"]
-	local myWSC = npc:WorldSpaceCenter()
-
-	for _, ply in player.Iterator() do
-		if IsValid(ply) and ply:Alive() and not NAPC.IsPlayerIgnored(ply) then
-			local dSqr = (ply:GetPos() - npcPos):LengthSqr()
-			if NAPC.IsFriendly(npc, ply) then
-				if dSqr <= 4194304 then
-					info.friendlyFirepower = info.friendlyFirepower + NAPC.GetFirepower(ply)
-				end
-			elseif dSqr <= 3240000 then
-				table.insert(info.allThreats, ply)
-				info.incomingThreatCenter = info.incomingThreatCenter + ply:GetPos()
-				if ply ~= enemy then
-					info.enemyFirepower = info.enemyFirepower + NAPC.GetFirepower(ply)
-				end
-				local toMe = (myWSC - ply:EyePos()):GetNormalized()
-				if ply:GetAimVector():Dot(toMe) > 0.85 then
-					info.threatsAimingAtMe = info.threatsAimingAtMe + 1
-				end
-			end
-		end
-	end
-
-	for mate, _ in pairs(NAPC.CurNPCList) do
-		if IsValid(mate) and mate ~= npc and mate:IsNPC() and mate:Alive() then
-			local matePos = mate:GetPos()
-			local dSqr = (matePos - npcPos):LengthSqr()
-
-			if NAPC.IsFriendly(npc, mate) then
-				if checkSquad and dSqr <= 4194304 then
-					table.insert(info.squadMembers, mate)
-					groupPosSum = groupPosSum + matePos
-					info.friendlyFirepower = info.friendlyFirepower + NAPC.GetFirepower(mate)
-
-					if mate:GetEnemy() == enemy then
-						info.squadTargetingSame = info.squadTargetingSame + 1
-					end
-
-					if
-						mate.CECA
-						and (mate.CECA.LastDecision == "INDIVIDUAL_RETREAT" or mate.CECA.LastDecision == "GROUP_ROUT")
-					then
-						info.routedSquadMates = info.routedSquadMates + 1
-					end
-
-					local mateRatio = mate:Health() / math.max(1, mate:GetMaxHealth())
-					if mateRatio > highestMateHpRatio then
-						highestMateHpRatio = mateRatio
-						info.healthiestMate = mate
-					end
-
-					if
-						mate:GetClass() == "npc_citizen"
-						and mate:HasSpawnFlags(SF_CITIZEN_MEDIC)
-						and mateRatio > 0.4
-					then
-						if dSqr < closestMedicDistSqr then
-							closestMedicDistSqr = dSqr
-							info.nearestMedic = mate
-						end
-					end
-				end
-			else
-				if dSqr <= 3240000 then
-					table.insert(info.allThreats, mate)
-					info.incomingThreatCenter = info.incomingThreatCenter + matePos
-					if mate ~= enemy then
-						info.enemyFirepower = info.enemyFirepower + NAPC.GetFirepower(mate)
-					end
-					if mate:GetEnemy() == npc then
-						info.threatsAimingAtMe = info.threatsAimingAtMe + 1
-					end
-				end
-			end
-		end
-	end
-
-	local threatCount = #info.allThreats
-	info.incomingThreatCenter = (threatCount > 0) and (info.incomingThreatCenter / threatCount) or enemyPos
-
-	info.isPincered = false
-	if threatCount >= 2 then
-		local threatDirs = {}
-		for i = 1, math.min(threatCount, 4) do
-			local th = info.allThreats[i]
-			if IsValid(th) then
-				table.insert(threatDirs, (th:GetPos() - npcPos):GetNormalized())
-			end
-		end
-		for i = 1, #threatDirs do
-			for j = i + 1, #threatDirs do
-				if threatDirs[i]:Dot(threatDirs[j]) < -0.15 then
-					info.isPincered = true
-					break
-				end
-			end
-			if info.isPincered then
-				break
-			end
-		end
-	end
-
-	info.squadCount = #info.squadMembers
-	info.groupCenter = groupPosSum / (info.squadCount + 1)
-
-	local mySquadID = NAPC.GetSquadID(npc)
-	info.theaterSquadData = mySquadID and NAPC.TheaterSquads[mySquadID] or nil
-
-	info.targetCanShootBack = NAPC.CanShootBack(enemy) and not info.isZombieOrHeadcrab
-	info.isUnderFire = (timeSinceDmg < 1.5) or (info.threatsAimingAtMe >= 1 and info.seeEnemy)
-	info.inCrossfire = info.isPincered or (info.threatsAimingAtMe >= 2)
-	info.recentCasualties = NAPC.GetRecentCasualtiesNear(npc, npcPos, 1800, 12)
-	info.isNearLethalZone = NAPC.IsPosNearLethalDanger(npcPos, 64)
-
-	local ceca = npc.CECA or npc.OODA
-	local stayDuration = NAPC.CurTime_Tick - ((ceca and ceca.PosStayTime) or NAPC.CurTime_Tick)
-	info.stayDuration = stayDuration
-
-	local isMatchingElevation = math.abs(info.enemyElevationDelta) <= 50
-	local isStaleCombat = stayDuration > 6.0 and ((ceca and ceca.ActiveDecisionDmgDealt or 0) < 10)
-	info.isElevationStalemate = isMatchingElevation
-		and (info.enemyDist >= 600)
-		and isStaleCombat
-		and (ceca and ceca.LastDecision == "HOLD_AND_ATTACK")
-
-	local wepClass = IsValid(weapon) and weapon:GetClass() or ""
-	local isWepShortRange = (wepClass == "weapon_shotgun" or wepClass == "weapon_smg1" or wepClass == "weapon_pistol")
-		and (info.enemyDist > 700)
-	local isFarIneffective = (info.enemyDist > 950 and stayDuration > 6.0)
-	info.isLongRangeStagnant = (
-		info.enemyDist > 850
-		and stayDuration > 6.5
-		and ((ceca and ceca.ActiveDecisionDmgDealt or 0) < 10)
-	)
-		or (isFarIneffective and stayDuration > 7.0)
-		or (isWepShortRange and stayDuration > 6.0)
-
-	return info
-end
-
-function NAPC.CECA_FormulateConceptualModel(npc, info, enemy)
-	local ceca = npc.CECA
-	local concept = ceca.ConceptualModel or {}
-	local powerRatio = info.friendlyFirepower / math.max(0.1, info.enemyFirepower)
-	local isIsolated = (info.squadCount == 0)
-	local isOutgunned = (powerRatio < 0.95)
-
-	if info.isZombieOrHeadcrab then
-		if info.enemyDist < 550 or info.zombieTooClose then
-			concept.DesiredState = "MELEE_STANDOFF_KITING"
-			concept.IdealRange = 650
-			concept.RequiresStandoff = true
-			concept.RequiresHighGround = false
-		else
-			concept.DesiredState = "RANGED_FIRE_SUPERIORITY_ZOMBIE"
-			concept.IdealRange = 600
-			concept.RequiresStandoff = false
-		end
-	elseif info.inCrossfire or info.isNearLethalZone or info.isTakingHeavyDPS then
-		concept.DesiredState = "EXTRICATE_CROSSFIRE"
-		concept.RequiresCrossfireBreak = true
-		concept.RequiresCover = true
-	elseif
-		info.healthRatio < 0.65
-		or (isIsolated and isOutgunned)
-		or info.enemyAimingAtMe
-		or (info.enemyDist < 400)
-	then
-		concept.DesiredState = "PRESERVE_AND_REARM"
-		concept.RequiresCover = true
-	elseif
-		info.enemyHasHighGround
-		and info.enemyElevationDelta > 80
-		and not info.enemyAimingAtMe
-		and info.healthRatio > 0.55
-	then
-		concept.DesiredState = "COUNTER_DOMINATE_HIGH_GROUND"
-		concept.RequiresHighGround = true
-		concept.RequiresCover = true
-	elseif info.flyerDamagedUs then
-		concept.DesiredState = "OVERHEAD_SHELTER_ENGAGEMENT"
-		concept.RequiresOverheadCover = true
-		concept.RequiresHighGround = false
-	elseif
-		not isIsolated
-		and (info.theaterSquadData and info.theaterSquadData.role == "SQUAD_ROLE_FLANK" or powerRatio > 1.2)
-		and not info.enemyAimingAtMe
-	then
-		concept.DesiredState = "ENFILADE_CROSSFIRE"
-		concept.RequiresFlank = true
-	elseif not isIsolated and info.theaterSquadData and info.theaterSquadData.role == "SQUAD_ROLE_SUPPRESS" then
-		concept.DesiredState = "SUPPRESSIVE_LOCK"
-		concept.RequiresCover = true
-	else
-		concept.DesiredState = "FIRE_SUPERIORITY"
-		concept.RequiresCover = true
-	end
-
-	ceca.ConceptualModel = concept
-	return concept
-end
-
-function NAPC.CECA_Explore(npc, enemy, info, infoNeeds)
-	local results = {}
-
-	if infoNeeds["NEED_KITE_POS"] or info.isZombieOrHeadcrab then
-		results.kiteRetreatPos = NAPC.FindKiteRetreatPos(npc, enemy, info.allThreats, 450, 850)
-	end
-
-	if infoNeeds["NEED_COVER_SHOOT_POS"] or infoNeeds["NEED_ADVANCE_COVER"] then
-		local coverPos = NAPC.FindCoverShootingPos(npc, enemy, info.allThreats, 320, 1200)
-		results.bestCoverShootPos = coverPos
-		if coverPos and (enemy:GetPos() - coverPos):Length() <= 650 and (enemy:GetPos() - coverPos):Length() >= 380 then
-			results.advanceCoverPos = coverPos
-		elseif infoNeeds["NEED_ADVANCE_COVER"] and (info.enemyDist > 480) then
-			results.advanceCoverPos =
-				NAPC.FindCoverShootingPos(npc, enemy, info.allThreats, 380, math.max(420, info.enemyDist - 120))
-		end
-	end
-
-	if infoNeeds["NEED_SHELTER_POS"] then
-		results.shelterCoverPos = NAPC.FindShelterCoverPos(npc, enemy, info.allThreats)
-	end
-	if infoNeeds["NEED_COUNTER_HIGH_GROUND"] or info.enemyHasHighGround then
-		results.counterHighGroundPos = NAPC.FindCounterHighGroundPos(npc, enemy, info.allThreats)
-	end
-	if infoNeeds["NEED_HIGH_GROUND"] or not info.hasHighGroundAdvantage then
-		results.highGroundPos = NAPC.FindCounterHighGroundPos(npc, enemy, info.allThreats)
-	end
-	if infoNeeds["NEED_LURE_RETREAT"] then
-		results.lureRetreatPos = NAPC.FindLureRetreatPos(npc, enemy, info.allThreats)
-	end
-	if infoNeeds["NEED_ENFILADE_POS"] then
-		results.enfiladeAdvantagePos = NAPC.FindEnfiladeVantagePos(npc, enemy, info.allThreats)
-	end
-	if infoNeeds["NEED_MEDIC_ROUTE"] and info.nearestMedic then
-		results.medicRetreatPos = NAPC.FindMedicRetreatPos(npc, info.nearestMedic, enemy)
-	end
-
-	return results
-end
-
-function NAPC.CECA_UpdateSituationModel(npc, info, exploreResults)
-	local sit = table.Copy(info)
-	for k, v in pairs(exploreResults) do
-		sit[k] = v
-	end
-
-	local ceca = npc.CECA or npc.OODA
-	sit.tacticalScores = (ceca and ceca.TacticalScores) or {}
-	sit.enemyVulnerable = (sit.enemyReloading or sit.enemyTurnedAway)
-	sit.hasCoveringFire = sit.theaterSquadData and sit.theaterSquadData.hasCoveringFire or false
-	sit.isRPGThreat = sit.enemyHasRPG or false
-	sit.caughtInCrossfire = sit.inCrossfire
-		or sit.isNearLethalZone
-		or sit.isPincered
-		or (
-			sit.isUnderFire
-			and not sit.bestCoverShootPos
-			and (sit.isTakingHeavyDPS or (sit.threatsAimingAtMe and sit.threatsAimingAtMe >= 1))
-		)
-
-	sit.isZombieOrHeadcrab = info.isZombieOrHeadcrab or false
-	sit.zombieTooClose = info.zombieTooClose or false
-	sit.isElevationStalemate = info.isElevationStalemate or false
-	sit.isLongRangeStagnant = info.isLongRangeStagnant or false
-
-	local enemy = npc:GetEnemy()
-	local prof = (IsValid(enemy) and ceca and ceca.EnemyProfile) and ceca.EnemyProfile[enemy:EntIndex()] or nil
-	sit.enemyIsRusher = prof and prof.isRusher or false
-
-	local failedFlanks = (ceca and ceca.FailedFlankAttempts) or 0
-	local flankScore = sit.tacticalScores["FLANK_MANEUVER"] or 0
-	sit.isIsolated = ((sit.squadCount or 0) == 0)
-	sit.isOutgunned = ((sit.enemyFirepower or 1) > (sit.friendlyFirepower or 1) * 1.15)
-
-	local class = npc:GetClass()
-	local isCombine = (class == "npc_combine_s")
-	local isMetro = (class == "npc_metropolice")
-	local isCitizen = (class == "npc_citizen")
-
-	local threat = 1
-	if sit.enemyAimingAtMe and sit.seeEnemy then
-		threat = threat + 2
-	end
-	if sit.enemyDistSqr < 90000 then
-		threat = threat + 1
-	end
-	if sit.healthRatio < 0.45 or sit.isTakingHeavyDPS then
-		threat = threat + 2
-	end
-	if sit.ammoLack then
-		threat = threat + 1
-	end
-	if sit.inCrossfire or sit.isNearLethalZone or sit.isPincered then
-		threat = threat + 3
-	end
-	if sit.enemyHasHighGround and sit.seeEnemy and sit.isUnderFire then
-		threat = threat + 1
-	end
-	if sit.zombieTooClose then
-		threat = math.max(threat, 3)
-	end
-
-	sit.threatLevel = math.Clamp(threat, 1, 4)
-
-	local groupMorale = 100
-	local powerRatio = (sit.friendlyFirepower or 1) / math.max(0.1, sit.enemyFirepower or 1)
-	if powerRatio < 0.5 then
-		groupMorale = groupMorale - (isCitizen and 42 or (isMetro and 30 or 0))
-	elseif powerRatio > 1.5 then
-		groupMorale = groupMorale + 20
-	end
-	groupMorale = groupMorale - ((sit.recentCasualties or 0) * (isCitizen and 38 or 28))
-	sit.groupMorale = isCombine and 100 or math.Clamp(groupMorale, 0, 100)
-
-	sit.groupBroken = not isCombine
-		and (sit.groupMorale <= (isCitizen and 50 or 38))
-		and ((sit.squadCount or 0) > 0 or (sit.recentCasualties or 0) >= 2)
-
-	local enemyCritical = sit.enemyCritical or (sit.enemyHealthRatio and sit.enemyHealthRatio <= 0.25)
-	local enemyPowerless = (powerRatio >= 2.5 and (sit.enemyHealthRatio or 1.0) <= 0.4)
-		or (sit.enemyReloading and powerRatio >= 1.6)
-	local pushSurvivable = (sit.healthRatio >= 0.55)
-		and not sit.isTakingHeavyDPS
-		and not sit.caughtInCrossfire
-		and not sit.isRPGThreat
-		and not ((sit.threatsAimingAtMe or 0) >= 1)
-		and not sit.enemyAimingAtMe
-		and not sit.isZombieOrHeadcrab
-
-	sit.enemyOverpowered = (enemyCritical or enemyPowerless) and pushSurvivable
-	sit.shouldPreserveSelf = (
-		(sit.healthRatio < (isCitizen and 0.55 or 0.40))
-		or sit.isTakingHeavyDPS
-		or (sit.isIsolated and sit.isOutgunned)
-		or sit.zombieTooClose
-		or (sit.isUnderFire and not sit.bestCoverShootPos)
-		or (sit.enemyAimingAtMe and sit.healthRatio < 0.65)
-	) and not sit.enemyOverpowered
-
-	sit.canFlank = (failedFlanks < 3)
-		and (flankScore > -2.0)
-		and not sit.isIsolated
-		and (
-			sit.enemyDistSqr > 62500
-			and sit.enemyDistSqr < 1960000
-			and not sit.shouldPreserveSelf
-			and not sit.caughtInCrossfire
-			and not (sit.enemyAimingAtMe and not sit.hasCoveringFire)
-		)
-
-	if ceca then
-		ceca.SituationModel = sit
-	end
-
-	return sit
-end
-
-function NAPC.CECA_Compare(npc, concept, sit)
-	local ceca = npc.CECA or npc.OODA
-	local candidateMoves = {}
-	local isIsolated = sit.isIsolated or ((sit.squadCount or 0) == 0)
-	local isOutgunned = sit.isOutgunned or false
-
-	if sit.isZombieOrHeadcrab then
-		if sit.enemyDist < 550 or sit.zombieTooClose then
-			table.insert(candidateMoves, "KITE_RETREAT")
-			if sit.lureRetreatPos and not isIsolated then
-				table.insert(candidateMoves, "BAIT_RETREAT")
-			end
-			table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		else
-			table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-			table.insert(candidateMoves, "HOLD_AND_ATTACK")
-			table.insert(candidateMoves, "SUPPRESSIVE_FIRE")
-			table.insert(candidateMoves, "KITE_RETREAT")
-		end
-	elseif sit.shouldPreserveSelf or sit.ammoLack or (isIsolated and isOutgunned) then
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		if sit.medicRetreatPos then
-			table.insert(candidateMoves, "MEDIC_RETREAT")
-		end
-		table.insert(candidateMoves, "INDIVIDUAL_RETREAT")
-	elseif sit.inCrossfire or sit.isNearLethalZone then
-		table.insert(candidateMoves, "BREAK_CROSSFIRE")
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		table.insert(candidateMoves, "INDIVIDUAL_RETREAT")
-	elseif sit.enemyHasHighGround and sit.counterHighGroundPos and not sit.enemyAimingAtMe then
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		table.insert(candidateMoves, "COUNTER_HIGH_GROUND")
-		if sit.canFlank and not isIsolated then
-			table.insert(candidateMoves, "FLANK_MANEUVER")
-		end
-	elseif (sit.highGroundPos or sit.hasHighGroundAdvantage) and sit.enemyDist >= 400 and not sit.enemyAimingAtMe then
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		table.insert(candidateMoves, "HIGH_GROUND_REINFORCE")
-		table.insert(candidateMoves, "HOLD_AND_ATTACK")
-	elseif sit.enfiladeAdvantagePos and not sit.enemyIsRusher and not isIsolated and not sit.enemyAimingAtMe then
-		table.insert(candidateMoves, "EXPLOIT_ENFILADE")
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		table.insert(candidateMoves, "HOLD_AND_ATTACK")
-	elseif sit.flyerDamagedUs then
-		if sit.shelterCoverPos then
-			table.insert(candidateMoves, "SHELTERED_WARFARE")
-		end
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		table.insert(candidateMoves, "BREAK_CROSSFIRE")
-		table.insert(candidateMoves, "INDIVIDUAL_RETREAT")
-	elseif sit.groupBroken then
-		table.insert(candidateMoves, "GROUP_ROUT")
-		table.insert(candidateMoves, "INDIVIDUAL_RETREAT")
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-	elseif sit.enemyHasRPG then
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		table.insert(candidateMoves, "BREAK_CROSSFIRE")
-		if not isIsolated and sit.canFlank then
-			table.insert(candidateMoves, "SQUAD_COORDINATED_FLANK")
-		end
-	else
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-
-		local squadRole = (sit.theaterSquadData and sit.theaterSquadData.role) or "AUTONOMOUS"
-		if squadRole == "SQUAD_ROLE_SUPPRESS" then
-			table.insert(candidateMoves, "SUPPRESSIVE_FIRE")
-			if sit.highGroundPos and sit.enemyDist >= 400 and not sit.enemyAimingAtMe then
-				table.insert(candidateMoves, "HIGH_GROUND_REINFORCE")
-			end
-		elseif squadRole == "SQUAD_ROLE_FLANK" and not isIsolated and sit.canFlank then
-			table.insert(candidateMoves, "SQUAD_COORDINATED_FLANK")
-			table.insert(candidateMoves, "FLANK_MANEUVER")
-		else
-			table.insert(candidateMoves, "HOLD_AND_ATTACK")
-			if sit.canFlank and not isIsolated then
-				table.insert(candidateMoves, "FLANK_MANEUVER")
-			end
-			if sit.highGroundPos and sit.enemyDist >= 400 and not sit.enemyAimingAtMe then
-				table.insert(candidateMoves, "HIGH_GROUND_REINFORCE")
-			end
-			if not sit.seeEnemy then
-				table.insert(candidateMoves, "REPOSITION_LOF")
-			end
-		end
-	end
-
-	if #candidateMoves == 0 then
-		table.insert(candidateMoves, "TAKE_COVER_SHOOTING_POS")
-		table.insert(candidateMoves, "HOLD_AND_ATTACK")
-	end
-
-	return NAPC.OODA_ChessEngine_Evaluate(npc, sit, sit, candidateMoves)
-end
-
 function NAPC.CECA_Adapt(npc, strategicDirective, sit, NPCClass, weapon)
 	local ceca = npc.CECA or npc.OODA
 	if not ceca then
@@ -8854,13 +8668,19 @@ function NAPC.CECA_Adapt(npc, strategicDirective, sit, NPCClass, weapon)
 		NAPC.AreaBumpTactical(ceca, "EXPLOIT_ENFILADE", 1.4)
 		NAPC.AreaBumpTactical(ceca, "FLANK_MANEUVER", 1.2)
 		NAPC.AreaBumpTactical(ceca, "HOLD_AND_ATTACK", -1.2)
+	elseif strategicDirective == "SQUAD_BOUNDING_ADVANCE" then
+		NAPC.AreaBumpTactical(ceca, "SQUAD_BOUNDING_ADVANCE", 1.5)
+		NAPC.AreaBumpTactical(ceca, "HOLD_AND_ATTACK", -1.0)
+	elseif strategicDirective == "SECURE_KEY_AREA" then
+		NAPC.AreaBumpTactical(ceca, "SECURE_KEY_AREA", 1.6)
+		NAPC.AreaBumpTactical(ceca, "HOLD_AND_ATTACK", -1.2)
 	elseif strategicDirective == "KITE_RETREAT" then
 		NAPC.AreaBumpTactical(ceca, "KITE_RETREAT", 1.6)
 		NAPC.AreaBumpTactical(ceca, "HOLD_AND_ATTACK", -2.2)
 		NAPC.AreaBumpTactical(ceca, "SUPPRESSIVE_FIRE", -1.8)
 	elseif strategicDirective == "SHELTERED_WARFARE" then
-		NAPC.AreaBumpTactical(ceca, "SHELTERED_WARFARE", 1.8)
-		NAPC.AreaBumpTactical(ceca, "HOLD_AND_ATTACK", -1.6)
+		NAPC.AreaBumpTactical(ceca, "SHELTERED_WARFARE", 2.0)
+		NAPC.AreaBumpTactical(ceca, "HOLD_AND_ATTACK", -1.8)
 		NAPC.AreaBumpTactical(ceca, "HIGH_GROUND_REINFORCE", -1.8)
 	elseif strategicDirective == "INDIVIDUAL_RETREAT" or strategicDirective == "GROUP_ROUT" then
 		NAPC.AreaBumpTactical(ceca, "INDIVIDUAL_RETREAT", 1.5)
@@ -8909,6 +8729,28 @@ function NAPC.Tick_AdvancedBehaviours(npc, NPCClass)
 	local moveAct = npc:GetMovementActivity()
 	local isRPGUser = NAPC.IsRocketLauncher(weapon)
 
+	if NPCClass == "npc_combine_s" and IsValid(enemy) and weapon:GetClass() == "weapon_ar2" then
+		local isElite = npc:GetInternalVariable("m_fIsElite")
+		if isElite then
+			local act = npc:GetActivity()
+			local seqName = string.lower(npc:GetSequenceName(npc:GetSequence()) or "")
+			local isAltFiring = (ACT_COMBINE_AR2_ALTFIRE and act == ACT_COMBINE_AR2_ALTFIRE)
+				or curSched == 142
+				or string.find(seqName, "altfire") ~= nil
+				or string.find(seqName, "shoot_ar2_alt") ~= nil
+
+			if isAltFiring then
+				local muzzlePos = npc:EyePos() + (npc:GetForward() * 20)
+				if not NAPC.CheckAR2BallClearance(npc, muzzlePos, enemy) then
+					npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(4.0, 7.0))
+					npc:SetSaveValue("m_vecAltFireTarget", Vector(0, 0, 0))
+					npc:SetSchedule(SCHED_RANGE_ATTACK1)
+					curSched = npc:GetCurrentSchedule()
+				end
+			end
+		end
+	end
+
 	if NPCState == NPC_STATE_ALERT and IsValid(enemy) and enemy:Alive() then
 		npc:SetNPCState(NPC_STATE_COMBAT)
 		NPCState = NPC_STATE_COMBAT
@@ -8919,7 +8761,21 @@ function NAPC.Tick_AdvancedBehaviours(npc, NPCClass)
 		and (NAPC.CurTime_Tick > (npc.NextPriorityEnemyCheck_NAPC or 0))
 	then
 		npc.NextPriorityEnemyCheck_NAPC = NAPC.CurTime_Tick + 0.4
-		local priorityTarget = isRPGUser and NAPC.FindRPGAntiAirTarget(npc) or NAPC.FindPriorityRPGEnemy(npc)
+		local priorityTarget, priorityReason = nil, nil
+
+		if isRPGUser then
+			priorityTarget = NAPC.FindRPGAntiAirTarget(npc) or NAPC.FindPriorityRPGEnemy(npc)
+			priorityReason = priorityTarget and "AIR_RPG_THREAT" or nil
+		else
+			priorityTarget, priorityReason = NAPC.FindKeyTargetPriority(npc, enemy)
+			if not priorityTarget then
+				priorityTarget = NAPC.FindPriorityRPGEnemy(npc)
+				priorityReason = priorityTarget and "RPG_ENEMY" or nil
+			end
+		end
+
+		npc.PriorityTarget_NAPC = priorityTarget
+		npc.PriorityReason_NAPC = priorityReason
 
 		if IsValid(priorityTarget) and priorityTarget ~= enemy then
 			npc:SetEnemy(priorityTarget)
@@ -9091,6 +8947,12 @@ NAPC.Tick_FuncList = {
 function NAPC.Tick_Core(npc, NPCClass)
 	if NPCClass == "npc_grenade_frag" then
 		if NAPC.ConvarsBool["NAPC_NPCs_RunFromGrenade"] then
+			local cur = NAPC.CurTime_Tick
+			if (npc.NextGrenadeCheck_NAPC or 0) > cur then
+				return
+			end
+			npc.NextGrenadeCheck_NAPC = cur + 0.25
+
 			local grePos = npc:GetPos()
 			local dmgRadius = npc:GetInternalVariable("m_DmgRadius") or 250
 			local checkRadius = math.max(dmgRadius * 1.6, 450)
@@ -9118,13 +8980,14 @@ function NAPC.Tick_Core(npc, NPCClass)
 end
 
 function NAPC.Tick_FindNPC()
-	for _, npc in ents.Iterator() do
-		if IsValid(npc) and npc:IsNPC() then
-			local NPCClass = npc:GetClass()
-			if NAPC.Tables.NPCClass_FindAll[NPCClass] then
+	for class, _ in pairs(NAPC.Tables.NPCClass_FindAll) do
+		local list = ents.FindByClass(class)
+		for i = 1, #list do
+			local npc = list[i]
+			if IsValid(npc) and npc:IsNPC() then
 				if NAPC.WorksOnANP(npc) then
 					NAPC.InitEnt(npc)
-					NAPC.Tick_Core(npc, NPCClass)
+					NAPC.Tick_Core(npc, class)
 				end
 				NAPC.CurNPCList[npc] = true
 			end
@@ -9595,15 +9458,26 @@ function NAPC.PostEntityTakeDamage(npc, _, _)
 	end
 end
 
+local BONE_HEAD_NAME = "ValveBiped.Bip01_Head1"
+
 function NAPC.EntityFireBullets(npc, data)
 	if NAPC.Enable_ThisAddon and npc:IsNPC() and NAPC.WorksOnANP(npc) then
 		local enemy = npc:GetEnemy()
 		if IsValid(enemy) then
 			local weapon = npc:GetActiveWeapon()
 			local enemypos = enemy:WorldSpaceCenter()
-			local enemyhead = enemy:LookupBone("ValveBiped.Bip01_Head1")
+			local NPCClass = npc:GetClass()
+			local enemyhead = nil
+
+			if
+				NAPC.ConvarsBool["NAPC_NPCs_AimForHead"]
+				or NAPC.ConvarsBool["NAPC_Turret_AccurateShot"]
+				or (npc.HasPerfectAccuracy_NAPC and NAPC.ConvarsBool["NAPC_NPCs_WeaponProficiency"])
+			then
+				enemyhead = enemy:LookupBone(BONE_HEAD_NAME)
+			end
+
 			if IsValid(weapon) then
-				local NPCClass = npc:GetClass()
 				if NAPC.Tables.NPCClass_Main[NPCClass] or NAPC.Tables.NPCClass_KeyNPCs[NPCClass] then
 					if data.Num < 2 then
 						npc.IsShotgunner_NAPC = false
