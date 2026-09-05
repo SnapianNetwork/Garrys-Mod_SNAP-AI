@@ -289,4 +289,25 @@ NAPC_Localization_EN = {
 		help_1 = "Allows manhacks deployed by Metropolice to fire bullets inherited from the deploying officer's weapon.",
 		help_2 = "Manhacks with SMG or Pistol will periodically fire at enemies within range.",
 	},
+	["NAPC_Generate_Windows"] = {
+		OptionName = "Generate Windows",
+		help_1 = "Sweeps the map, indexes all glass windows and breakable surfaces, and highlights their extents in debug visualization.",
+	},
+	["NAPC_Debug_ShowWindows"] = {
+		OptionName = "Show Indexed Windows",
+		help_1 = "Toggles 3D debug rendering for indexed windows and geometric apertures.",
+	},
+	["NAPC_Clear_Windows"] = {
+		OptionName = "Clear Windows",
+		help_1 = "Clears all cached and indexed window data from memory.",
+	},
+	["NAPC_NPCs_SMG_AltFire"] = {
+		OptionName = "Enable NPCs SMG Alt-Fire",
+		help_1 = "Allows NPCs wielding the SMG1 (Combine, Metropolice, Citizens) to launch grenades at distant enemies with simulated trajectory tracking.",
+	},
+	["NAPC_Metropolice_StunstickSwitch"] = {
+		OptionName = "Enable Metropolice Draw Pistol",
+		help_1 = "Allows stunstick-wielding Metropolice to discard their stunstick and draw a pistol when facing armed ranged enemies.",
+		help_2 = "They will drop the stunstick as a physics entity and draw their sidearm.",
+	}
 }

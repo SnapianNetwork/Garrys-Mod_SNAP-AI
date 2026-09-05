@@ -35,6 +35,13 @@ local function NAPC_Panel_1(panel)
 	panel:CheckBox(NAPC_Text["NAPC_Debug_AreaScores"].OptionName, "NAPC_Debug_AreaScores")
 	panel:ControlHelp(NAPC_Text["NAPC_Debug_AreaScores"].help_1)
 	panel:ControlHelp(NAPC_Text["NAPC_Debug_AreaScores"].help_2)
+	panel:CheckBox(NAPC_Text["NAPC_Debug_ShowWindows"].OptionName, "NAPC_Debug_ShowWindows")
+	panel:ControlHelp(NAPC_Text["NAPC_Debug_ShowWindows"].help_1)
+	panel:Help([[ ]])
+	panel:Button(NAPC_Text["NAPC_Generate_Windows"].OptionName, "napc_generate_windows")
+	panel:ControlHelp(NAPC_Text["NAPC_Generate_Windows"].help_1)
+	panel:Button(NAPC_Text["NAPC_Clear_Windows"].OptionName, "napc_clear_windows")
+	panel:ControlHelp(NAPC_Text["NAPC_Clear_Windows"].help_1)
 	panel:Help([[ ]])
 	panel:CheckBox(NAPC_Text["NAPC_WorksOn_ANPlus"].OptionName, "NAPC_WorksOn_ANPlus")
 	panel:ControlHelp(NAPC_Text["NAPC_WorksOn_ANPlus"].help_1)
@@ -53,6 +60,8 @@ local function NAPC_Panel_2(panel)
 	panel:Help(NAPC_Text["Partition Description"].part2)
 	panel:Help([[ ]])
 	panel:Help([[ ]])
+	panel:CheckBox(NAPC_Text["NAPC_NPCs_SMG_AltFire"].OptionName, "NAPC_NPCs_SMG_AltFire")
+	panel:ControlHelp(NAPC_Text["NAPC_NPCs_SMG_AltFire"].help_1)
 	panel:CheckBox(NAPC_Text["NAPC_NPCs_CAN_JUMP"].OptionName, "NAPC_NPCs_CAN_JUMP")
 	panel:ControlHelp(NAPC_Text["NAPC_NPCs_CAN_JUMP"].help_1)
 	panel:CheckBox(NAPC_Text["NAPC_NPCs_HealthRegen"].OptionName, "NAPC_NPCs_HealthRegen")
@@ -155,6 +164,9 @@ local function NAPC_Panel_3(panel)
 	panel:CheckBox(NAPC_Text["NAPC_Metropolice_PistolReady"].OptionName, "NAPC_Metropolice_PistolReady")
 	panel:ControlHelp(NAPC_Text["NAPC_Metropolice_PistolReady"].help_1)
 	panel:ControlHelp(NAPC_Text["NAPC_Metropolice_PistolReady"].help_2)
+	panel:CheckBox(NAPC_Text["NAPC_Metropolice_StunstickSwitch"].OptionName, "NAPC_Metropolice_StunstickSwitch")
+	panel:ControlHelp(NAPC_Text["NAPC_Metropolice_StunstickSwitch"].help_1)
+	panel:ControlHelp(NAPC_Text["NAPC_Metropolice_StunstickSwitch"].help_2)
 	panel:CheckBox(NAPC_Text["NAPC_Manhack_Shooting"].OptionName, "NAPC_Manhack_Shooting")
 	panel:ControlHelp(NAPC_Text["NAPC_Manhack_Shooting"].help_1)
 	panel:ControlHelp(NAPC_Text["NAPC_Manhack_Shooting"].help_2)
@@ -279,8 +291,26 @@ local DebugPayload = nil
 local LastDebugReceived = 0
 
 net.Receive("NAPC_DebugData", function()
-	DebugPayload = net.ReadTable()
-	LastDebugReceived = CurTime()
+	local len = net.ReadUInt(32)
+	if not len or len <= 0 then
+		return
+	end
+
+	local compressed = net.ReadData(len)
+	if not compressed then
+		return
+	end
+
+	local jsonStr = util.Decompress(compressed)
+	if not jsonStr then
+		return
+	end
+
+	local data = util.JSONToTable(jsonStr)
+	if istable(data) then
+		DebugPayload = data
+		LastDebugReceived = CurTime()
+	end
 end)
 
 local function DrawNAPC_OverheadDebug()
@@ -320,7 +350,9 @@ local function DrawNAPC_OverheadDebug()
 				local roleColor = Color(0, 190, 255)
 				if npc.ooda and npc.ooda.decision then
 					local dec = npc.ooda.decision
-					if string.find(dec, "RETREAT") or string.find(dec, "ROUT") then
+					if string.find(dec, "SNIPER") then
+						roleColor = Color(50, 255, 180)
+					elseif string.find(dec, "RETREAT") or string.find(dec, "ROUT") then
 						roleColor = Color(255, 65, 65)
 					elseif string.find(dec, "FLANK") then
 						roleColor = Color(255, 175, 0)
@@ -604,7 +636,7 @@ local function DrawNAPC_HUDDashboard()
 			end
 
 			draw.SimpleText(
-				string.format("[%s] Role: %s", sqID, sq.role),
+				string.format("[%s] Role: %s", tostring(sqID or "UNKNOWN"), tostring(sq.role or "AUTONOMOUS")),
 				"NAPC_Debug_Text",
 				panelX + 10,
 				curY,
@@ -646,7 +678,13 @@ local function DrawNAPC_HUDDashboard()
 
 		for _, pt in ipairs(DebugPayload.priorityTargets) do
 			draw.SimpleText(
-				string.format("[%d] %s (%d%% HP) - %s", pt.entIdx, pt.class, math.floor(pt.hpRatio * 100), pt.reason),
+				string.format(
+					"[%d] %s (%d%% HP) - %s",
+					pt.entIdx or 0,
+					tostring(pt.class or "unknown"),
+					math.floor((pt.hpRatio or 1) * 100),
+					tostring(pt.reason or "PRIORITY")
+				),
 				"NAPC_Debug_Small",
 				panelX + 12,
 				curY,
@@ -654,7 +692,7 @@ local function DrawNAPC_HUDDashboard()
 				TEXT_ALIGN_LEFT
 			)
 			draw.SimpleText(
-				string.format("%d Focusers", pt.targetedBy),
+				string.format("%d Focusers", pt.targetedBy or 0),
 				"NAPC_Debug_Small",
 				panelX + panelW - 10,
 				curY,
@@ -707,6 +745,33 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 		return
 	end
 
+	for _, arc in ipairs(DebugPayload.smgGrenadeArcs or {}) do
+		local arcCol = arc.valid and Color(255, 130, 0, 240) or Color(255, 50, 50, 240)
+		if arc.hitEnemy then
+			arcCol = Color(255, 80, 255, 255)
+		end
+
+		local pts = arc.path or {}
+		for i = 1, #pts - 1 do
+			if pts[i] and pts[i + 1] then
+				render.DrawLine(pts[i], pts[i + 1], arcCol, false)
+			end
+		end
+
+		if arc.finalPos and isvector(arc.finalPos) then
+			render.DrawWireframeSphere(arc.finalPos, 14, 8, 8, arcCol, false)
+			render.DrawWireframeSphere(arc.finalPos, 220, 16, 16, Color(arcCol.r, arcCol.g, arcCol.b, 60), false)
+			render.DrawWireframeBox(
+				arc.finalPos,
+				Angle(0, 0, 0),
+				Vector(-6, -6, -6),
+				Vector(6, 6, 6),
+				Color(255, 255, 255, 220),
+				false
+			)
+		end
+	end
+
 	for _, arc in ipairs(DebugPayload.grenadeArcs or {}) do
 		local arcCol = arc.valid and Color(0, 255, 120, 230) or Color(255, 50, 50, 230)
 		if arc.hitEnemy then
@@ -729,6 +794,39 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 		if arc.finalPos and isvector(arc.finalPos) then
 			render.DrawWireframeSphere(arc.finalPos, 14, 8, 8, arcCol, false)
 			render.DrawWireframeSphere(arc.finalPos, 220, 16, 16, Color(arcCol.r, arcCol.g, arcCol.b, 60), false)
+		end
+	end
+
+	for _, arc in ipairs(DebugPayload.energyBallArcs or {}) do
+		local arcCol = arc.valid and Color(255, 150, 0, 240) or Color(255, 50, 50, 240)
+		if arc.hitEnemy then
+			arcCol = Color(255, 225, 50, 255)
+		end
+
+		local pts = arc.path or {}
+		for i = 1, #pts - 1 do
+			if pts[i] and pts[i + 1] then
+				render.DrawLine(pts[i], pts[i + 1], arcCol, false)
+			end
+		end
+
+		for _, bPos in ipairs(arc.bounces or {}) do
+			if isvector(bPos) then
+				render.DrawWireframeSphere(bPos, 8, 8, 8, Color(0, 240, 255, 240), false)
+				render.DrawWireframeBox(
+					bPos,
+					Angle(0, 0, 0),
+					Vector(-5, -5, -5),
+					Vector(5, 5, 5),
+					Color(255, 255, 255, 220),
+					false
+				)
+			end
+		end
+
+		if arc.finalPos and isvector(arc.finalPos) then
+			render.DrawWireframeSphere(arc.finalPos, 16, 8, 8, arcCol, false)
+			render.DrawWireframeSphere(arc.finalPos, 80, 12, 12, Color(arcCol.r, arcCol.g, arcCol.b, 70), false)
 		end
 	end
 
@@ -782,6 +880,19 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 		end
 	end
 
+	local showWindows = GetConVar("NAPC_Debug_ShowWindows") and GetConVar("NAPC_Debug_ShowWindows"):GetBool()
+	if showWindows then
+		for _, win in ipairs(DebugPayload.windows or {}) do
+			if win and win.pos and win.mins and win.maxs then
+				local winCol = Color(0, 230, 255, 220)
+				render.DrawWireframeBox(win.pos, win.angles or Angle(0, 0, 0), win.mins, win.maxs, winCol, false)
+
+				local center = win.center or (win.pos + (win.mins + win.maxs) * 0.5)
+				render.DrawWireframeSphere(center, 5, 6, 6, Color(255, 255, 255, 240), false)
+			end
+		end
+	end
+
 	for _, z in ipairs(DebugPayload.dangerZones or {}) do
 		if z and z.pos and isvector(z.pos) then
 			render.DrawWireframeSphere(z.pos, z.radius or 120, 12, 12, Color(255, 40, 40, 100), false)
@@ -800,6 +911,37 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 				Color(255, 180, 0, 220),
 				false
 			)
+		end
+	end
+
+	for _, npc in ipairs(DebugPayload.npcs or {}) do
+		if npc and npc.sniperPos and isvector(npc.sniperPos) then
+			local sniperCol = Color(50, 255, 180, 240)
+
+			render.DrawLine(npc.pos + Vector(0, 0, 32), npc.sniperPos + Vector(0, 0, 32), sniperCol, false)
+			render.DrawWireframeBox(
+				npc.sniperPos,
+				Angle(0, 0, 0),
+				Vector(-12, -12, 0),
+				Vector(12, 12, 64),
+				sniperCol,
+				false
+			)
+			render.DrawWireframeSphere(npc.sniperPos + Vector(0, 0, 60), 8, 8, 8, Color(255, 255, 255, 240), false)
+
+			if npc.enemyIdx then
+				for _, enemyNpc in ipairs(DebugPayload.npcs or {}) do
+					if enemyNpc.entIdx == npc.enemyIdx then
+						render.DrawLine(
+							npc.sniperPos + Vector(0, 0, 60),
+							enemyNpc.eyePos or (enemyNpc.pos + Vector(0, 0, 50)),
+							Color(255, 80, 120, 180),
+							false
+						)
+						break
+					end
+				end
+			end
 		end
 	end
 
@@ -849,7 +991,7 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 						end
 					end
 				end
-			elseif npc.forcedGo and isvector(npc.forcedGo) then
+			elseif npc.forcedGo and isvector(npc.forcedGo) and not npc.sniperPos then
 				render.DrawLine(
 					npc.pos + Vector(0, 0, 32),
 					npc.forcedGo + Vector(0, 0, 32),
