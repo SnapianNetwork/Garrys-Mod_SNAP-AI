@@ -499,51 +499,123 @@ local function DrawNAPC_AreaScoresDebug()
 		return
 	end
 
-	local eyePos = LocalPlayer():EyePos()
+	local localPly = LocalPlayer()
+	local eyePos = localPly:EyePos()
+	local cx, cy = ScrW() * 0.5, ScrH() * 0.5
 
 	for _, area in ipairs(DebugPayload.areaScores) do
 		if area and area.pos and isvector(area.pos) then
 			local dist = eyePos:Distance(area.pos)
-			if dist <= 3000 then
-				local screen = (area.pos + Vector(0, 0, 16)):ToScreen()
+			if dist <= 2400 then
+				local screen = (area.pos + Vector(0, 0, 14)):ToScreen()
 				if screen.visible then
-					local col = Color(120, 255, 120)
-					if area.danger >= 4 then
-						col = Color(255, 60, 60)
-					elseif area.danger >= 2 then
-						col = Color(255, 160, 40)
-					elseif area.danger >= 0.8 then
-						col = Color(255, 255, 100)
-					end
+					local distToCrosshair = math.sqrt((screen.x - cx) ^ 2 + (screen.y - cy) ^ 2)
+					local isHovered = distToCrosshair < 70 and dist <= 1600
+					local danger = area.danger or 0
+					local flank = area.flank or 0
+					local overlook = area.overlook or 0
 
-					draw.SimpleText(
-						string.format(
-							"NavArea %d [%s] (Avoidance: %.1f)",
-							area.id,
-							area.faction or "combine",
-							area.danger or 0
-						),
-						"NAPC_Debug_Text",
-						screen.x,
-						screen.y - 12,
-						col,
-						TEXT_ALIGN_CENTER
-					)
-					draw.SimpleText(
-						string.format(
-							"Deaths: %.1f | Watchers: %.1f | Fire: %.1f | Flank: %.2f | Ridge: %.2f",
-							area.deaths or 0,
-							area.seen or 0,
-							area.fired or 0,
-							area.flank or 0,
-							area.overlook or 0
-						),
-						"NAPC_Debug_Small",
-						screen.x,
-						screen.y + 2,
-						Color(220, 220, 220),
-						TEXT_ALIGN_CENTER
-					)
+					local hasSignificance = danger >= 0.8 or flank >= 0.35 or overlook >= 0.35
+					if isHovered or hasSignificance then
+						local col = Color(100, 255, 120)
+						if danger >= 4 then
+							col = Color(255, 60, 60)
+						elseif danger >= 2 then
+							col = Color(255, 160, 40)
+						elseif danger >= 0.8 then
+							col = Color(255, 230, 80)
+						elseif flank >= 0.4 then
+							col = Color(255, 185, 30)
+						elseif overlook >= 0.4 then
+							col = Color(0, 215, 255)
+						end
+
+						if isHovered then
+							local cardW = 190
+							local cardH = 46
+							local cardX = screen.x - (cardW * 0.5)
+							local cardY = screen.y - cardH - 8
+
+							surface.SetDrawColor(10, 14, 20, 230)
+							surface.DrawRect(cardX, cardY, cardW, cardH)
+							surface.SetDrawColor(col.r, col.g, col.b, 255)
+							surface.DrawOutlinedRect(cardX, cardY, cardW, cardH, 1)
+
+							draw.SimpleText(
+								string.format("NavArea #%d [%s]", area.id, area.faction or "combine"),
+								"NAPC_Debug_Text",
+								cardX + 6,
+								cardY + 3,
+								Color(255, 255, 255),
+								TEXT_ALIGN_LEFT
+							)
+							draw.SimpleText(
+								string.format("Danger: %.1f", danger),
+								"NAPC_Debug_Text",
+								cardX + cardW - 6,
+								cardY + 3,
+								col,
+								TEXT_ALIGN_RIGHT
+							)
+							draw.SimpleText(
+								string.format(
+									"Deaths: %.1f | Fire: %.1f | Watch: %.1f",
+									area.deaths or 0,
+									area.fired or 0,
+									area.seen or 0
+								),
+								"NAPC_Debug_Small",
+								cardX + 6,
+								cardY + 18,
+								Color(200, 200, 200),
+								TEXT_ALIGN_LEFT
+							)
+							draw.SimpleText(
+								string.format("Flank: %.2f | Ridge: %.2f", flank, overlook),
+								"NAPC_Debug_Small",
+								cardX + 6,
+								cardY + 30,
+								(flank > 0.35 or overlook > 0.35) and Color(255, 215, 100) or Color(160, 160, 160),
+								TEXT_ALIGN_LEFT
+							)
+						else
+							local badgeTxt = ""
+							if danger >= 2.0 then
+								badgeTxt = string.format("⚠ DANGER %.1f", danger)
+							elseif flank >= 0.4 then
+								badgeTxt = string.format("⇗ FLANK %.2f", flank)
+							elseif overlook >= 0.4 then
+								badgeTxt = string.format("▲ RIDGE %.2f", overlook)
+							elseif danger >= 0.8 then
+								badgeTxt = string.format("⚠ %.1f", danger)
+							end
+
+							if badgeTxt ~= "" then
+								surface.SetFont("NAPC_Debug_Small")
+								local tw, th = surface.GetTextSize(badgeTxt)
+								local padX, padY = 5, 2
+								local bgW = tw + (padX * 2)
+								local bgH = th + (padY * 2)
+								local bgX = screen.x - (bgW * 0.5)
+								local bgY = screen.y - (bgH * 0.5)
+
+								surface.SetDrawColor(12, 16, 22, 215)
+								surface.DrawRect(bgX, bgY, bgW, bgH)
+								surface.SetDrawColor(col.r, col.g, col.b, 200)
+								surface.DrawOutlinedRect(bgX, bgY, bgW, bgH, 1)
+
+								draw.SimpleText(
+									badgeTxt,
+									"NAPC_Debug_Small",
+									screen.x,
+									screen.y,
+									col,
+									TEXT_ALIGN_CENTER,
+									TEXT_ALIGN_CENTER
+								)
+							end
+						end
+					end
 				end
 			end
 		end
@@ -834,13 +906,13 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 	if showAreaScores then
 		for _, area in ipairs(DebugPayload.areaScores or {}) do
 			if area and area.pos and isvector(area.pos) then
-				local col = Color(100, 255, 100, 180)
+				local col = Color(100, 255, 100, 140)
 				if area.danger >= 4 then
-					col = Color(255, 50, 50, 220)
+					col = Color(255, 50, 50, 200)
 				elseif area.danger >= 2 then
-					col = Color(255, 160, 40, 200)
+					col = Color(255, 160, 40, 180)
 				elseif area.danger >= 0.8 then
-					col = Color(255, 255, 80, 180)
+					col = Color(255, 230, 80, 160)
 				end
 
 				local corners = area.corners
@@ -856,23 +928,19 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 					render.DrawLine(corners[2], corners[3], col, false)
 					render.DrawLine(corners[3], corners[4], col, false)
 					render.DrawLine(corners[4], corners[1], col, false)
-
-					local innerCol = Color(col.r, col.g, col.b, math.floor(col.a * 0.35))
-					render.DrawLine(corners[1], corners[3], innerCol, false)
-					render.DrawLine(corners[2], corners[4], innerCol, false)
 				end
 
-				if (area.flank or 0) > 0.35 then
-					render.DrawWireframeSphere(area.pos + Vector(0, 0, 14), 14, 8, 8, Color(255, 180, 0, 200), false)
+				if (area.flank or 0) > 0.4 then
+					render.DrawWireframeSphere(area.pos + Vector(0, 0, 14), 10, 6, 6, Color(255, 185, 30, 200), false)
 				end
 
-				if (area.overlook or 0) > 0.35 then
+				if (area.overlook or 0) > 0.4 then
 					render.DrawWireframeBox(
-						area.pos + Vector(0, 0, 18),
+						area.pos + Vector(0, 0, 14),
 						Angle(0, 0, 0),
-						Vector(-8, -8, 0),
-						Vector(8, 8, 20),
-						Color(0, 200, 255, 220),
+						Vector(-6, -6, 0),
+						Vector(6, 6, 16),
+						Color(0, 215, 255, 200),
 						false
 					)
 				end
