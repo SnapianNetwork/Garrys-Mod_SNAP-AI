@@ -90,6 +90,7 @@ if not ConVarExists("NPC_AVOID_PLAYER_CROSSHAIR") then
 	CreateConVar("NAPC_Manhack_Shooting", 0, FCVAR_NOTIFY + FCVAR_ARCHIVE)
 	CreateConVar("NAPC_NPCs_SMG_AltFire", 1, FCVAR_NOTIFY + FCVAR_ARCHIVE)
 	CreateConVar("NAPC_Metropolice_StunstickSwitch", 1, FCVAR_NOTIFY + FCVAR_ARCHIVE)
+	CreateConVar("NAPC_Debug_ShowPriorityTargets", 1, FCVAR_NOTIFY + FCVAR_ARCHIVE + FCVAR_REPLICATED)
 end
 
 local NAPC = {}
@@ -436,8 +437,8 @@ NAPC.AreaScore_FireMemory = 25
 NAPC.AreaScore_DeathDecay = 90
 NAPC.AreaScore_InfluenceRadius = 250
 NAPC.AreaScore_InfluenceRadiusSqr = NAPC.AreaScore_InfluenceRadius * NAPC.AreaScore_InfluenceRadius
-NAPC.AreaScore_MinSizeDimension = 20
-NAPC.AreaScore_MinAreaSurface = 400
+NAPC.AreaScore_MinSizeDimension = 96
+NAPC.AreaScore_MinAreaSurface = 12000
 
 NAPC.NextAreaSquadRoleUpdate = 0
 
@@ -2134,6 +2135,8 @@ function NAPC.AreaUpdateSquadRoles(now)
 				processedTheaters[theaterKey] = theaterData
 			end
 
+			local isSecureSquad = (sq.role == "SQUAD_ROLE_SECURE")
+
 			for i, m in ipairs(members) do
 				if m.OODA and m.OODA.LastDecision == "SNIPER_WINDOW_VANTAGE" then
 					m.SquadRole_NAPC = {
@@ -2146,12 +2149,18 @@ function NAPC.AreaUpdateSquadRoles(now)
 					local role = "SUPPRESS"
 					local targetPos = nil
 
-					if i == 1 and theaterData.flank then
+					if isSecureSquad then
+						role = "SECURE"
+						targetPos = NAPC.FindKeyTacticalArea(m, enemy, sq.center)
+					elseif i == 1 and theaterData.flank then
 						role = "FLANK"
 						targetPos = theaterData.flank
 					elseif i == 2 and theaterData.overwatch then
 						role = "OVERWATCH"
 						targetPos = theaterData.overwatch
+					elseif i >= 4 then
+						role = "SECURE"
+						targetPos = NAPC.FindKeyTacticalArea(m, enemy, sq.center)
 					end
 
 					m.SquadRole_NAPC = {
@@ -2230,40 +2239,74 @@ function NAPC.AreaDebugRender(now)
 		return
 	end
 
+	local devPlayers = {}
+	for _, ply in player.Iterator() do
+		if IsValid(ply) and (ply:GetInfoNum("developer", 0) > 0 or GetConVar("developer"):GetInt() > 0) then
+			devPlayers[#devPlayers + 1] = ply
+		end
+	end
+	if #devPlayers == 0 then
+		return
+	end
+
 	for _, rec in pairs(NAPC.AreaScoreRecords) do
 		if now <= rec.trackedUntil + 5 then
-			local faction = NAPC.AreaDebugNearestFaction(rec.pos)
-			local danger = NAPC.AreaDangerScore(rec, faction, now)
-
-			local col = Color(100, 255, 120)
-			if danger >= 4 then
-				col = Color(255, 50, 50)
-			elseif danger >= 2 then
-				col = Color(255, 160, 40)
-			elseif danger >= 0.8 then
-				col = Color(255, 230, 80)
-			end
-
-			local c = rec.corners
-			if c and #c == 4 then
-				debugoverlay.Line(c[1], c[2], 0.7, col, true)
-				debugoverlay.Line(c[2], c[3], 0.7, col, true)
-				debugoverlay.Line(c[3], c[4], 0.7, col, true)
-				debugoverlay.Line(c[4], c[1], 0.7, col, true)
-			end
-
-			local flank = rec.flankDebug or 0
-			local overlook = rec.overlookDebug or 0
-			if danger >= 1.5 or flank >= 0.45 or overlook >= 0.45 then
-				local tag = string.format("#%d [D:%.1f", rec.id, danger)
-				if flank >= 0.35 then
-					tag = tag .. string.format(" F:%.2f", flank)
+			local areaPos = rec.pos
+			if isvector(areaPos) then
+				local isVisible = false
+				for i = 1, #devPlayers do
+					local ply = devPlayers[i]
+					local eyePos = ply:EyePos()
+					if (areaPos - eyePos):LengthSqr() <= 5760000 then
+						local targetPos = areaPos + Vector(0, 0, 16)
+						local tr = util.TraceLine({
+							start = eyePos,
+							endpos = targetPos,
+							mask = MASK_OPAQUE,
+							filter = ply,
+						})
+						if not tr.Hit or tr.Fraction >= 0.95 or (tr.HitPos - targetPos):LengthSqr() <= 1024 then
+							isVisible = true
+							break
+						end
+					end
 				end
-				if overlook >= 0.35 then
-					tag = tag .. string.format(" R:%.2f", overlook)
+
+				if isVisible then
+					local faction = NAPC.AreaDebugNearestFaction(areaPos)
+					local danger = NAPC.AreaDangerScore(rec, faction, now)
+
+					local col = Color(100, 255, 120)
+					if danger >= 4 then
+						col = Color(255, 50, 50)
+					elseif danger >= 2 then
+						col = Color(255, 160, 40)
+					elseif danger >= 0.8 then
+						col = Color(255, 230, 80)
+					end
+
+					local c = rec.corners
+					if c and #c == 4 then
+						debugoverlay.Line(c[1], c[2], 0.7, col, false)
+						debugoverlay.Line(c[2], c[3], 0.7, col, false)
+						debugoverlay.Line(c[3], c[4], 0.7, col, false)
+						debugoverlay.Line(c[4], c[1], 0.7, col, false)
+					end
+
+					local flank = rec.flankDebug or 0
+					local overlook = rec.overlookDebug or 0
+					if danger >= 1.5 or flank >= 0.45 or overlook >= 0.45 then
+						local tag = string.format("#%d [D:%.1f", rec.id, danger)
+						if flank >= 0.35 then
+							tag = tag .. string.format(" F:%.2f", flank)
+						end
+						if overlook >= 0.35 then
+							tag = tag .. string.format(" R:%.2f", overlook)
+						end
+						tag = tag .. "]"
+						debugoverlay.Text(areaPos + Vector(0, 0, 8), tag, 0.7, false)
+					end
 				end
-				tag = tag .. "]"
-				debugoverlay.Text(rec.pos + Vector(0, 0, 8), tag, 0.7, col, true)
 			end
 		end
 	end
@@ -2278,12 +2321,19 @@ function NAPC.AreaDebugRender(now)
 				col = Color(0, 200, 255)
 			elseif role.role == "SUPPRESS" then
 				col = Color(180, 100, 255)
+			elseif role.role == "SECURE" then
+				col = Color(50, 220, 100)
 			end
 
-			debugoverlay.Text(npc:GetPos() + Vector(0, 0, 84), "ROLE: " .. tostring(role.role), 0.7, col, true)
+			local displayTxt = "ROLE: " .. tostring(role.role)
+			if role.role == "SECURE" then
+				displayTxt = npc.IsSecuringExtender_NAPC and "ROLE: SECURE (EXTEND)" or "ROLE: SECURE (DEFEND)"
+			end
+
+			debugoverlay.Text(npc:GetPos() + Vector(0, 0, 84), displayTxt, 0.7, false)
 			if role.pos then
-				debugoverlay.Line(npc:EyePos(), role.pos + Vector(0, 0, 28), 0.7, col, true)
-				debugoverlay.Cross(role.pos + Vector(0, 0, 28), 14, 0.7, col, true)
+				debugoverlay.Line(npc:EyePos(), role.pos + Vector(0, 0, 28), 0.7, col, false)
+				debugoverlay.Cross(role.pos + Vector(0, 0, 28), 14, 0.7, col, false)
 			end
 		end
 	end
@@ -2611,7 +2661,7 @@ function NAPC.FindKeyTacticalArea(npc, enemy, groupCenter)
 		return nil
 	end
 
-	local cur = NAPC.CurTime_Tick
+	local cur = NAPC.CurTime_Tick or CurTime()
 	local npcPos = npc:GetPos()
 
 	if npc.CachedKeyAreaTime_NAPC and (cur - npc.CachedKeyAreaTime_NAPC < 1.8) then
@@ -2624,28 +2674,162 @@ function NAPC.FindKeyTacticalArea(npc, enemy, groupCenter)
 	local enemyEye = enemy:EyePos()
 	local center = isvector(groupCenter) and groupCenter or npcPos
 	local myFaction = NAPC.AreaGetFactionOf(npc)
+	local mySquadID = NAPC.GetSquadID(npc)
+
+	local friendlies = { npc }
+	for ally, _ in pairs(NAPC.CurNPCList) do
+		if IsValid(ally) and ally ~= npc and ally:IsNPC() and ally:Alive() and NAPC.IsFriendly(npc, ally) then
+			local isSameSquad = mySquadID and (NAPC.GetSquadID(ally) == mySquadID)
+			local isNearby = (ally:GetPos() - npcPos):LengthSqr() <= 1440000
+			if isSameSquad or isNearby then
+				friendlies[#friendlies + 1] = ally
+			end
+		end
+	end
+
+	local isExtender = false
+	if #friendlies <= 1 then
+		local localDanger = NAPC.AreaGetDangerAtPos(npcPos, myFaction, cur, enemy)
+		isExtender = (localDanger <= 0.8) and ((npcPos - enemyPos):Length() >= 500)
+	else
+		local existingExtender = nil
+		for _, ally in ipairs(friendlies) do
+			if ally ~= npc and ally.IsSecuringExtender_NAPC and (cur < (ally.SecuringExtenderTime_NAPC or 0)) then
+				existingExtender = ally
+				break
+			end
+		end
+
+		if existingExtender then
+			isExtender = false
+		else
+			table.sort(friendlies, function(a, b)
+				local hpA = a:Health() / math.max(1, a:GetMaxHealth())
+				local hpB = b:Health() / math.max(1, b:GetMaxHealth())
+				if math.abs(hpA - hpB) > 0.15 then
+					return hpA > hpB
+				end
+				return a:EntIndex() < b:EntIndex()
+			end)
+			isExtender = (friendlies[1] == npc)
+		end
+	end
+
+	npc.IsSecuringExtender_NAPC = isExtender
+	if isExtender then
+		npc.SecuringExtenderTime_NAPC = cur + 4.5
+	else
+		npc.SecuringExtenderTime_NAPC = nil
+	end
 
 	local bestAreaPos = nil
+
 	if navmesh and navmesh.IsLoaded and navmesh.IsLoaded() then
 		local bestScore = -math.huge
 
-		for _, rec in pairs(NAPC.AreaScoreRecords) do
-			if cur <= rec.trackedUntil and isvector(rec.pos) then
-				local dToEnemy = (rec.pos - enemyPos):Length()
-				local dToGroup = (rec.pos - center):Length()
+		if not isExtender then
+			for _, rec in pairs(NAPC.AreaScoreRecords) do
+				if cur <= rec.trackedUntil and isvector(rec.pos) then
+					local dToGroup = (rec.pos - center):Length()
+					local dToEnemy = (rec.pos - enemyPos):Length()
 
-				if dToEnemy >= 350 and dToEnemy <= 1600 and dToGroup <= 2000 then
-					local danger = NAPC.AreaDangerScore(rec, myFaction, cur, enemy)
-					local flank = NAPC.AreaScoreFlankPos(rec.pos, enemy)
-					local overlook = NAPC.AreaScoreOverlookPos(rec.pos, enemy, rec)
+					if dToGroup <= 580 and dToEnemy >= 380 then
+						local danger = NAPC.AreaDangerScore(rec, myFaction, cur, enemy)
 
-					local score = (overlook * 50) + (flank * 35) - (danger * 25) - (math.abs(dToEnemy - 650) * 0.04)
+						if danger <= 1.2 then
+							local overlook = NAPC.AreaScoreOverlookPos(rec.pos, enemy, rec)
 
-					if score > bestScore and NAPC.IsDestinationValid(npc, rec.pos, false) then
-						bestScore = score
-						bestAreaPos = rec.pos
+							local standEye = rec.pos + Vector(0, 0, 64)
+							local trStand = util.TraceLine({
+								start = standEye,
+								endpos = enemyEye,
+								mask = MASK_SHOT,
+								filter = npc,
+							})
+							local hasLOS = not trStand.Hit or trStand.Fraction >= 0.88 or trStand.Entity == enemy
+
+							local crouchEye = rec.pos + Vector(0, 0, 36)
+							local trCrouch = util.TraceLine({
+								start = crouchEye,
+								endpos = enemyEye,
+								mask = MASK_SHOT,
+								filter = npc,
+							})
+							local hasCover = trCrouch.Hit and trCrouch.Fraction < 0.95 and trCrouch.Entity ~= enemy
+
+							local score = (hasCover and 45 or 15)
+								+ (hasLOS and 35 or 10)
+								+ (overlook * 30)
+								+ ((1.2 - danger) * 30)
+								- (math.abs(dToGroup - 220) * 0.05)
+
+							if score > bestScore and NAPC.IsDestinationValid(npc, rec.pos, false) then
+								bestScore = score
+								bestAreaPos = rec.pos
+							end
+						end
 					end
 				end
+			end
+
+			if not bestAreaPos then
+				bestAreaPos = NAPC.FindCoverShootingPos(npc, enemy, nil, 380, 750)
+			end
+		else
+			local defendedRadius = 350
+			local maxExtensionDist = 950
+
+			for _, rec in pairs(NAPC.AreaScoreRecords) do
+				if cur <= rec.trackedUntil and isvector(rec.pos) then
+					local dToGroup = (rec.pos - center):Length()
+					local dToEnemy = (rec.pos - enemyPos):Length()
+
+					if dToGroup >= defendedRadius and dToGroup <= maxExtensionDist and dToEnemy >= 420 then
+						local danger = NAPC.AreaDangerScore(rec, myFaction, cur, enemy)
+
+						if danger <= 0.85 then
+							local overlook = NAPC.AreaScoreOverlookPos(rec.pos, enemy, rec)
+							local flank = NAPC.AreaScoreFlankPos(rec.pos, enemy)
+
+							local standEye = rec.pos + Vector(0, 0, 64)
+							local trStand = util.TraceLine({
+								start = standEye,
+								endpos = enemyEye,
+								mask = MASK_SHOT,
+								filter = npc,
+							})
+							local hasLOS = not trStand.Hit or trStand.Fraction >= 0.88 or trStand.Entity == enemy
+
+							local crouchEye = rec.pos + Vector(0, 0, 36)
+							local trCrouch = util.TraceLine({
+								start = crouchEye,
+								endpos = enemyEye,
+								mask = MASK_SHOT,
+								filter = npc,
+							})
+							local hasCover = trCrouch.Hit and trCrouch.Fraction < 0.95 and trCrouch.Entity ~= enemy
+
+							local expansionProgress = math.Clamp((dToGroup - defendedRadius) / 400, 0, 1) * 35
+							local safetyBonus = (0.85 - danger) * 40
+							local score = expansionProgress
+								+ safetyBonus
+								+ (hasCover and 40 or 15)
+								+ (hasLOS and 25 or 10)
+								+ (overlook * 25)
+								+ (flank * 20)
+								- (math.abs(dToEnemy - 600) * 0.03)
+
+							if score > bestScore and NAPC.IsDestinationValid(npc, rec.pos, false) then
+								bestScore = score
+								bestAreaPos = rec.pos
+							end
+						end
+					end
+				end
+			end
+
+			if not bestAreaPos then
+				bestAreaPos = NAPC.FindCoverShootingPos(npc, enemy, nil, 420, 850)
 			end
 		end
 	end
@@ -7032,7 +7216,12 @@ function NAPC.OODA_GenerateCandidateMoves(npc, obs, orient)
 	end
 
 	if
-		(orient.squadRole == "SQUAD_ROLE_SECURE" or orient.squadRole == "OVERWATCH" or obs.squadCount >= 1)
+		(
+			orient.squadRole == "SQUAD_ROLE_SECURE"
+			or orient.squadRole == "SECURE"
+			or orient.squadRole == "OVERWATCH"
+			or obs.squadCount >= 1
+		)
 		and not orient.shouldPreserveSelf
 		and not obs.inCrossfire
 	then
@@ -7072,6 +7261,19 @@ function NAPC.OODA_PredictEnemyCounter(obs, orient, candidateMove)
 		exploitWindow = false,
 		punishSeverity = 0,
 	}
+
+	if candidateMove == "SECURE_KEY_AREA" then
+		local isExtender = obs._npc and (obs._npc.IsSecuringExtender_NAPC == true)
+		if isExtender then
+			counter.expectedAction = "ENEMY_TERRITORY_ENCROACHED"
+			counter.threatMulti = 0.50
+			counter.exploitWindow = true
+		else
+			counter.expectedAction = "ENEMY_BLOCKED_BY_DEFENSE_PERIMETER"
+			counter.threatMulti = 0.30
+		end
+		return counter
+	end
 
 	if candidateMove == "SNIPER_WINDOW_VANTAGE" then
 		if obs.enemyDist > 900 or obs.enemyTurnedAway then
@@ -7321,10 +7523,23 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 		end
 	elseif candidateMove == "SECURE_KEY_AREA" then
 		if obs.keyAreaPos and not orient.shouldPreserveSelf and not isZombie then
-			local roleBonus = (orient.squadRole == "SQUAD_ROLE_SECURE" or orient.squadRole == "OVERWATCH") and 25 or 10
-			positionalControl = positionalControl + 32 + roleBonus
-			expectedDmgDealt = (obs.friendlyFirepower or 1) * 24 * aggressionBias
-			expectedDmgTaken = (obs.enemyFirepower or 1) * 2.5 * enemyCounter.threatMulti
+			local isExtender = npc and (npc.IsSecuringExtender_NAPC == true)
+			local isSecureRole = (
+				orient.squadRole == "SQUAD_ROLE_SECURE"
+				or orient.squadRole == "SECURE"
+				or orient.squadRole == "OVERWATCH"
+			)
+			local roleBonus = isSecureRole and 25 or 10
+
+			if isExtender then
+				positionalControl = positionalControl + 32 + roleBonus
+				expectedDmgDealt = (obs.friendlyFirepower or 1) * 22 * aggressionBias
+				expectedDmgTaken = (obs.enemyFirepower or 1) * 1.8 * enemyCounter.threatMulti
+			else
+				positionalControl = positionalControl + 36 + roleBonus
+				expectedDmgDealt = (obs.friendlyFirepower or 1) * 20 * aggressionBias
+				expectedDmgTaken = (obs.enemyFirepower or 1) * 0.9 * enemyCounter.threatMulti
+			end
 		else
 			positionalControl = positionalControl - 40
 		end
@@ -7449,6 +7664,7 @@ function NAPC.OODA_SimulateMove(npc, candidateMove, obs, orient)
 	local isRepositionOrCover = (
 		candidateMove == "SNIPER_WINDOW_VANTAGE"
 		or candidateMove == "TAKE_COVER_SHOOTING_POS"
+		or candidateMove == "SECURE_KEY_AREA"
 		or candidateMove == "INDIVIDUAL_RETREAT"
 		or candidateMove == "GROUP_ROUT"
 		or candidateMove == "MEDIC_RETREAT"
@@ -7757,17 +7973,64 @@ function NAPC.OODA_Act(npc, decision, obs, orient, NPCClass, weapon)
 			npc:SetSchedule(SCHED_RANGE_ATTACK1)
 		end
 	elseif decision == "SECURE_KEY_AREA" then
-		if IsValid(enemy) and not isMoving and not ooda.ActionApplied then
-			local targetPos = obs.keyAreaPos or obs.bestCoverShootPos
-			local speed = isCitizen and math.Rand(1.35, 1.45) or 1.4
-			NAPC.OODA_DispatchMove(npc, ooda, targetPos, SCHED_TAKE_COVER_FROM_ENEMY, speed, 3.2)
-		elseif
-			not isMoving
-			and obs.canAttack
-			and curSched ~= SCHED_RANGE_ATTACK1
-			and not NAPC.Tables.ActiveCombatSchedules[curSched]
-		then
-			npc:SetSchedule(SCHED_RANGE_ATTACK1)
+		local targetPos = obs.keyAreaPos or obs.bestCoverShootPos
+		local isExtender = (npc.IsSecuringExtender_NAPC == true)
+
+		if isExtender then
+			if IsValid(enemy) and not isMoving and not ooda.ActionApplied then
+				local speed = isCitizen and math.Rand(1.05, 1.15) or 1.10
+				NAPC.OODA_DispatchMove(npc, ooda, targetPos, SCHED_FORCED_GO_RUN, speed, 4.0)
+			elseif not isMoving then
+				NAPC.Tick_MovementSpeed(npc, 1.0)
+				if
+					obs.canAttack
+					and curSched ~= SCHED_RANGE_ATTACK1
+					and not NAPC.Tables.ActiveCombatSchedules[curSched]
+				then
+					npc:SetSchedule(SCHED_RANGE_ATTACK1)
+				elseif not NAPC.Tables.ActiveCombatSchedules[curSched] and curSched ~= SCHED_COMBAT_FACE then
+					npc:SetSchedule(SCHED_COMBAT_FACE)
+				end
+			end
+		else
+			local myPos = npc:GetPos()
+			local isAtDefendPos = targetPos and (myPos - targetPos):LengthSqr() <= 6400
+
+			if isAtDefendPos or not targetPos then
+				if npc.ForcedGoPos_NAPC then
+					npc.ForcedGoPos_NAPC = nil
+					if isMoving then
+						npc:ClearSchedule()
+					end
+				end
+				NAPC.Tick_MovementSpeed(npc, 1.0)
+				ooda.ActionApplied = true
+
+				if
+					obs.canAttack
+					and curSched ~= SCHED_RANGE_ATTACK1
+					and not NAPC.Tables.ActiveCombatSchedules[curSched]
+				then
+					npc:SetSchedule(
+						(npc:HasCondition(COND.CAN_MELEE_ATTACK1) and obs.enemyDist < 80 and not obs.isZombieOrHeadcrab)
+								and SCHED_MELEE_ATTACK1
+							or SCHED_RANGE_ATTACK1
+					)
+				elseif
+					not NAPC.Tables.ActiveCombatSchedules[curSched]
+					and curSched ~= SCHED_COMBAT_FACE
+					and curSched ~= SCHED_AMBUSH
+				then
+					if obs.seeEnemy then
+						npc:SetSchedule(SCHED_COMBAT_FACE)
+					else
+						npc:SetSchedule(SCHED_AMBUSH)
+					end
+				end
+			elseif not isMoving and not ooda.ActionApplied then
+				local speed = isCitizen and math.Rand(1.15, 1.25) or 1.20
+				NAPC.OODA_DispatchMove(npc, ooda, targetPos, SCHED_TAKE_COVER_FROM_ENEMY, speed, 2.5)
+			end
 		end
 	elseif decision == "MEDIC_RETREAT" then
 		if NPCClass == "npc_combine_s" and NAPC.ConvarsBool["NAPC_Combine_Cloaking"] then
@@ -8987,7 +9250,9 @@ function NAPC.ExecuteAR2BankShot(npc, enemy, launchPos, bouncePos, aimDir, simDa
 		return
 	end
 
-	npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(8.0, 15.0)
+	local cur = NAPC.CurTime_Tick or CurTime()
+	npc.NextFireAR2Ball_NAPC = cur + math.Rand(8.0, 15.0)
+	npc.NextFireContactBall_NAPC = cur + math.Rand(5.0, 8.0)
 	npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(8.0, 15.0))
 
 	npc:StopMoving()
@@ -9015,32 +9280,49 @@ function NAPC.ExecuteAR2BankShot(npc, enemy, launchPos, bouncePos, aimDir, simDa
 	if hasGesture then
 		seqDuration = npc:SequenceDuration(seqID) or 1.4
 		npc:AddGestureSequence(seqID, true)
+	else
+		npc:RestartGesture(ACT_GESTURE_RANGE_ATTACK1)
+		seqDuration = 1.0
 	end
 
-	npc.AltFireEnd_NAPC = NAPC.CurTime_Tick + math.max(0.8, seqDuration)
+	npc.AltFireEnd_NAPC = cur + math.max(0.8, seqDuration)
 
-	if not (isElite and hasGesture) then
+	local engineHandlesAltFire = isElite and hasGesture
+
+	if not engineHandlesAltFire then
 		local ballSpeed = NAPC.ConvarsBool["NAPC_Faster_AR2Balls"] and 2000 or 1000
-		local ent = ents.Create("prop_combine_ball")
-		if IsValid(ent) then
-			ent:SetOwner(npc)
-			ent:SetPos(launchPos + (aimDir * 24))
-			ent:Spawn()
-			ent:SetSaveValue("m_flRadius", 10)
-			ent:SetSaveValue("m_nState", 2)
+		local delay = hasGesture and 0.35 or 0.05
 
-			local phys = ent:GetPhysicsObject()
-			if IsValid(phys) then
-				phys:SetVelocity(aimDir * ballSpeed)
+		timer.Simple(delay, function()
+			if not IsValid(npc) or not npc:Alive() then
+				return
 			end
-			ent:EmitSound("NPC_CombineBall.Launch")
 
-			timer.Simple(math.Rand(3.5, 5.0), function()
-				if IsValid(ent) then
-					ent:Fire("Explode")
+			local att = npc:GetAttachment(npc:LookupAttachment("muzzle"))
+			local spawnPos = att and att.Pos or (npc:EyePos() + (npc:GetForward() * 20))
+			local fireDir = isvector(aimDir) and aimDir or npc:GetForward()
+
+			local ent = ents.Create("prop_combine_ball")
+			if IsValid(ent) then
+				ent:SetOwner(npc)
+				ent:SetPos(spawnPos + (fireDir * 16))
+				ent:Spawn()
+				ent:SetSaveValue("m_flRadius", 10)
+				ent:SetSaveValue("m_nState", 2)
+
+				local phys = ent:GetPhysicsObject()
+				if IsValid(phys) then
+					phys:SetVelocity(fireDir * ballSpeed)
 				end
-			end)
-		end
+				ent:EmitSound("NPC_CombineBall.Launch")
+
+				timer.Simple(math.Rand(3.5, 5.0), function()
+					if IsValid(ent) then
+						ent:Fire("Explode")
+					end
+				end)
+			end
+		end)
 	end
 
 	table.insert(NAPC.DebugEnergyBallArcs, {
@@ -9051,7 +9333,7 @@ function NAPC.ExecuteAR2BankShot(npc, enemy, launchPos, bouncePos, aimDir, simDa
 		bounces = simData and simData.bounces or { bouncePos },
 		valid = true,
 		hitEnemy = simData and simData.hitEnemy or false,
-		expire = NAPC.CurTime_Tick + 4.0,
+		expire = cur + 4.0,
 	})
 
 	if #NAPC.DebugEnergyBallArcs > 10 then
@@ -9060,27 +9342,27 @@ function NAPC.ExecuteAR2BankShot(npc, enemy, launchPos, bouncePos, aimDir, simDa
 end
 
 function NAPC.Bullet_FireAR2Ball(npc, enemypos, weapon, data)
-	local isElite = npc:GetInternalVariable("m_fIsElite")
-	if isElite and not NAPC.ConvarsBool["NAPC_NPCs_AR2_AltFire"] then
-		return
-	end
+	local NPCClass = npc:GetClass()
+	local isCombineOrMetro = (NPCClass == "npc_combine_s" or NPCClass == "npc_metropolice")
+	local isElite = (NPCClass == "npc_combine_s") and npc:GetInternalVariable("m_fIsElite")
 
 	local canAltFire = NAPC.ConvarsBool["NAPC_NPCs_AR2_AltFire"]
-		or (NAPC.ConvarsBool["NAPC_Combine_AR2_AltFire"] and npc:GetClass() == "npc_combine_s" and not isElite)
+		or (NAPC.ConvarsBool["NAPC_Combine_AR2_AltFire"] and isCombineOrMetro)
 	if not canAltFire then
-		return
+		return false
 	end
 	if not (weapon:GetClass() == "weapon_ar2" and npc:IsOnGround()) then
-		return
+		return false
 	end
 
+	local cur = NAPC.CurTime_Tick or CurTime()
 	local nextAR2Ball = npc.NextFireAR2Ball_NAPC
 	if not nextAR2Ball then
-		npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(3, 8)
-		return
+		npc.NextFireAR2Ball_NAPC = cur + math.Rand(3, 8)
+		return false
 	end
-	if nextAR2Ball > NAPC.CurTime_Tick then
-		return
+	if nextAR2Ball > cur then
+		return false
 	end
 
 	local enemy = npc:GetEnemy()
@@ -9095,14 +9377,17 @@ function NAPC.Bullet_FireAR2Ball(npc, enemypos, weapon, data)
 		local bouncePos, aimDir, simData = NAPC.FindBounceAR2BallTarget(npc, muzzlePos, enemy, targetPos, false)
 		if bouncePos and aimDir then
 			NAPC.ExecuteAR2BankShot(npc, enemy, muzzlePos, bouncePos, aimDir, simData)
-			return
+			data.Damage = 0
+			data.Num = 0
+			return true
 		end
 
-		npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(3.0, 5.0)
-		return
+		npc.NextFireAR2Ball_NAPC = cur + math.Rand(3.0, 5.0)
+		return false
 	end
 
-	npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(8, 16)
+	npc.NextFireAR2Ball_NAPC = cur + math.Rand(8, 16)
+	npc.NextFireContactBall_NAPC = cur + math.Rand(5, 8)
 	npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(8, 16))
 
 	local seqID = npc:LookupSequence("shootar2alt")
@@ -9114,34 +9399,56 @@ function NAPC.Bullet_FireAR2Ball(npc, enemypos, weapon, data)
 	if hasGesture then
 		npc:StopMoving()
 		npc:AddGestureSequence(seqID, true)
-		npc.AltFireEnd_NAPC = NAPC.CurTime_Tick + (npc:SequenceDuration(seqID) or 1.4)
+		npc.AltFireEnd_NAPC = cur + (npc:SequenceDuration(seqID) or 1.4)
+	else
+		npc:StopMoving()
+		npc:RestartGesture(ACT_GESTURE_RANGE_ATTACK1)
+		npc.AltFireEnd_NAPC = cur + 1.0
 	end
 
-	if not (isElite and hasGesture) then
-		local ent = ents.Create("prop_combine_ball")
-		if not IsValid(ent) then
-			return
-		end
+	local engineHandlesAltFire = isElite and hasGesture
+
+	if not engineHandlesAltFire then
+		local ballSpeed = NAPC.ConvarsBool["NAPC_Faster_AR2Balls"] and 2000 or 1000
 		local aimVec = (targetPos - muzzlePos):GetNormalized()
-		ent:SetOwner(npc)
-		ent:SetPos(muzzlePos + (aimVec * 32))
-		ent:Spawn()
-		ent:SetSaveValue("m_flRadius", 10)
-		ent:SetSaveValue("m_nState", 2)
-		local phys = ent:GetPhysicsObject()
-		if IsValid(phys) then
-			local ballSpeed = NAPC.ConvarsBool["NAPC_Faster_AR2Balls"] and 2000 or 1000
-			phys:SetVelocity(aimVec * ballSpeed)
-		end
-		ent:EmitSound("NPC_CombineBall.Launch")
-		timer.Simple(math.Rand(2, 4), function()
+		local delay = hasGesture and 0.35 or 0.05
+
+		timer.Simple(delay, function()
+			if not IsValid(npc) or not npc:Alive() then
+				return
+			end
+
+			local att = npc:GetAttachment(npc:LookupAttachment("muzzle"))
+			local spawnOrigin = att and att.Pos or (npc:EyePos() + (npc:GetForward() * 20))
+
+			local ent = ents.Create("prop_combine_ball")
 			if IsValid(ent) then
-				ent:Fire("Explode")
+				ent:SetOwner(npc)
+				ent:SetPos(spawnOrigin + (aimVec * 16))
+				ent:Spawn()
+				ent:SetSaveValue("m_flRadius", 10)
+				ent:SetSaveValue("m_nState", 2)
+
+				local phys = ent:GetPhysicsObject()
+				if IsValid(phys) then
+					phys:SetVelocity(aimVec * ballSpeed)
+				end
+				ent:EmitSound("NPC_CombineBall.Launch")
+
+				timer.Simple(math.Rand(2.5, 4.5), function()
+					if IsValid(ent) then
+						ent:Fire("Explode")
+					end
+				end)
 			end
 		end)
 	else
 		npc:SetSaveValue("m_vecAltFireTarget", targetPos)
 	end
+
+	data.Damage = 0
+	data.Num = 0
+	return true
 end
 
 function NAPC.Bullet_BetterTurret(npc, enemy, enemypos, enemyhead, data)
@@ -9293,12 +9600,14 @@ function NAPC.WakenStupidNPC(IsTickUse, npc, attacker, enemy, NPCClass, curSched
 		local patience = npc.Patience_NAPC or 5
 		if seeEnemyTime + patience * 1.2 < NAPC.CurTime_Tick then
 			npc:ClearSchedule()
-			if NPCClass == "npc_combine_s" then
-				local isElite = npc:GetInternalVariable("m_fIsElite")
+			if NPCClass == "npc_combine_s" or NPCClass == "npc_metropolice" then
+				local isElite = (NPCClass == "npc_combine_s") and npc:GetInternalVariable("m_fIsElite")
+				local wep = npc:GetActiveWeapon()
+				local hasAR2 = IsValid(wep) and wep:GetClass() == "weapon_ar2"
 				local targetPos = npc:GetEnemyLastSeenPos(enemy)
-				local hasClearance = isElite and NAPC.CheckAR2BallClearance(npc, npc:EyePos(), enemy or targetPos)
+				local hasClearance = hasAR2 and NAPC.CheckAR2BallClearance(npc, npc:EyePos(), enemy or targetPos)
 
-				if isElite and hasClearance then
+				if hasAR2 and hasClearance then
 					npc:SetSaveValue("m_vecAltFireTarget", targetPos)
 
 					local seqID = npc:LookupSequence("shootar2alt")
@@ -9306,13 +9615,54 @@ function NAPC.WakenStupidNPC(IsTickUse, npc, attacker, enemy, NPCClass, curSched
 						seqID = npc:LookupSequence("shoot_ar2_alt")
 					end
 
-					if seqID and seqID ~= -1 then
+					local hasGesture = seqID and seqID ~= -1
+					if hasGesture then
 						npc:AddGestureSequence(seqID, true)
 						npc.AltFireEnd_NAPC = NAPC.CurTime_Tick + (npc:SequenceDuration(seqID) or 1.4)
-					elseif ACT_COMBINE_AR2_ALTFIRE then
-						npc:SetActivity(ACT_COMBINE_AR2_ALTFIRE)
-					elseif ACT_RANGE_ATTACK2 then
-						npc:SetActivity(ACT_RANGE_ATTACK2)
+					else
+						npc:RestartGesture(ACT_GESTURE_RANGE_ATTACK1)
+						npc.AltFireEnd_NAPC = NAPC.CurTime_Tick + 1.0
+					end
+
+					local engineHandlesAltFire = isElite and hasGesture
+					if not engineHandlesAltFire then
+						local muzzlePos = npc:EyePos() + (npc:GetForward() * 20)
+						local aimVec = (targetPos - muzzlePos):GetNormalized()
+						local ballSpeed = NAPC.ConvarsBool["NAPC_Faster_AR2Balls"] and 2000 or 1000
+
+						timer.Simple(hasGesture and 0.35 or 0.05, function()
+							if not IsValid(npc) or not npc:Alive() then
+								return
+							end
+							local ent = ents.Create("prop_combine_ball")
+							if IsValid(ent) then
+								ent:SetOwner(npc)
+								ent:SetPos(muzzlePos + (aimVec * 24))
+								ent:Spawn()
+								ent:SetSaveValue("m_flRadius", 10)
+								ent:SetSaveValue("m_nState", 2)
+								local phys = ent:GetPhysicsObject()
+								if IsValid(phys) then
+									phys:SetVelocity(aimVec * ballSpeed)
+								end
+								ent:EmitSound("NPC_CombineBall.Launch")
+								timer.Simple(math.Rand(2.5, 4.5), function()
+									if IsValid(ent) then
+										ent:Fire("Explode")
+									end
+								end)
+							end
+						end)
+					end
+				elseif hasAR2 and not hasClearance then
+					local muzzlePos = npc:EyePos() + (npc:GetForward() * 20)
+					local bouncePos, aimDir, simData =
+						NAPC.FindBounceAR2BallTarget(npc, muzzlePos, enemy, targetPos, false)
+					if bouncePos and aimDir then
+						NAPC.ExecuteAR2BankShot(npc, enemy, muzzlePos, bouncePos, aimDir, simData)
+					else
+						npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(4, 7))
+						npc:SetSaveValue("m_hForcedGrenadeTarget", enemy)
 					end
 				else
 					npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(4, 7))
@@ -11564,6 +11914,435 @@ function NAPC.TryFireSMGGrenade(npc, enemy, weapon)
 	return true
 end
 
+function NAPC.SimulateContactBallTrajectory(npc, launchPos, launchVel, maxTime, enemy, simDt)
+	maxTime = maxTime or 3.2
+	simDt = simDt or 0.05
+
+	if not isvector(launchPos) or not isvector(launchVel) then
+		return false, launchPos, Vector(0, 0, 1), {}, false, 0
+	end
+
+	local grav = GetConVar("sv_gravity") and GetConVar("sv_gravity"):GetFloat() or 600
+	local gravVec = Vector(0, 0, grav)
+	local dt = simDt
+
+	local curPos = Vector(launchPos.x, launchPos.y, launchPos.z)
+	local curVel = Vector(launchVel.x, launchVel.y, launchVel.z)
+	local path = { curPos }
+	local totalTime = 0
+	local filter = { npc, IsValid(npc) and npc:GetActiveWeapon() or nil, enemy }
+
+	local finalPos = curPos
+	local finalNormal = Vector(0, 0, 1)
+	local hitEnemy = false
+	local hitFriendly = false
+
+	local enemyPos = IsValid(enemy) and enemy:WorldSpaceCenter() or nil
+	local enemyVel = IsValid(enemy) and enemy:GetVelocity() or Vector(0, 0, 0)
+
+	local trData = {
+		mins = Vector(-4, -4, -4),
+		maxs = Vector(4, 4, 4),
+		mask = MASK_SOLID,
+		filter = filter,
+	}
+
+	while totalTime < maxTime do
+		local nextPos = curPos + (curVel * dt) - (0.5 * gravVec * (dt * dt))
+		local nextVel = curVel - (gravVec * dt)
+
+		if enemyPos and totalTime > 0.12 then
+			local predPos = enemyPos + (enemyVel * totalTime)
+			if (nextPos - predPos):LengthSqr() <= 6400 then
+				hitEnemy = true
+				finalPos = nextPos
+				finalNormal = (nextPos - predPos):GetNormalized()
+				table.insert(path, nextPos)
+				totalTime = totalTime + dt
+				break
+			end
+		end
+
+		trData.start = curPos
+		trData.endpos = nextPos
+		local tr = util.TraceHull(trData)
+
+		if tr.Hit then
+			if (tr.HitPos - launchPos):LengthSqr() < 10000 then
+				return false, launchPos, Vector(0, 0, 1), {}, false, 0
+			end
+
+			table.insert(path, tr.HitPos)
+			finalPos = tr.HitPos
+			finalNormal = tr.HitNormal
+
+			local hitEnt = tr.Entity
+			if IsValid(hitEnt) and NAPC.IsFriendly(npc, hitEnt) then
+				hitFriendly = true
+			end
+			totalTime = totalTime + (dt * tr.Fraction)
+			break
+		else
+			table.insert(path, nextPos)
+			curPos = nextPos
+			curVel = nextVel
+			totalTime = totalTime + dt
+		end
+	end
+
+	local distTraveledSqr = (finalPos - launchPos):LengthSqr()
+	if distTraveledSqr < 160000 then
+		return false, finalPos, finalNormal, path, false, totalTime
+	end
+
+	local isBlastSafe = NAPC.IsGrenadeBlastSafe(npc, finalPos, 220)
+	local isValid = not hitFriendly and isBlastSafe
+
+	return isValid, finalPos, finalNormal, path, hitEnemy, totalTime
+end
+
+function NAPC.AttachContactEnergyBallToPath(ball, simData, npc, weapon)
+	if not IsValid(ball) or not simData or not simData.path or #simData.path < 2 then
+		if IsValid(ball) then
+			ball:Remove()
+		end
+		return
+	end
+
+	local path = simData.path
+	local flightTime = math.max(0.3, simData.duration or ((#path - 1) * (simData.dt or 0.05)))
+	local startTime = CurTime()
+	local shooter = IsValid(npc) and npc or ball:GetOwner()
+	local wep = IsValid(weapon) and weapon
+		or (IsValid(shooter) and shooter.GetActiveWeapon and shooter:GetActiveWeapon() or nil)
+	local startOrigin = path[1]
+
+	util.SpriteTrail(ball, 0, Color(0, 210, 255, 230), false, 16, 1, 0.3, 1 / (16 + 1) * 0.5, "trails/laser.vmt")
+
+	local function DetonateEnergyBall(hitPos, hitNormal)
+		if not IsValid(ball) then
+			return
+		end
+		hitPos = hitPos or ball:GetPos()
+		hitNormal = hitNormal or Vector(0, 0, 1)
+
+		local attacker = IsValid(shooter) and shooter or ball
+		local dmg = DamageInfo()
+		dmg:SetDamage(125)
+		dmg:SetDamageType(bit.bor(DMG_DISSOLVE, DMG_BLAST))
+		dmg:SetAttacker(attacker)
+		dmg:SetInflictor(IsValid(wep) and wep or ball)
+		util.BlastDamageInfo(dmg, hitPos, 230)
+
+		local ed = EffectData()
+		ed:SetOrigin(hitPos)
+		ed:SetNormal(hitNormal)
+		ed:SetScale(1.3)
+		ed:SetMagnitude(2)
+		util.Effect("cball_explode", ed, true, true)
+		util.Effect("AR2Explosion", ed, true, true)
+		util.Effect("Explosion", ed, true, true)
+
+		sound.Play("weapons/physcannon/energy_sing_explosion2.wav", hitPos, 95, 105)
+		sound.Play("NPC_CombineBall.Explosion", hitPos, 90, 110)
+		ball:Remove()
+	end
+
+	local hookName = "NAPC_ContactBallTrack_" .. ball:EntIndex()
+	hook.Add("Think", hookName, function()
+		if not IsValid(ball) then
+			hook.Remove("Think", hookName)
+			return
+		end
+
+		local elapsed = CurTime() - startTime
+		local progress = elapsed / flightTime
+
+		if progress >= 1.0 then
+			hook.Remove("Think", hookName)
+			DetonateEnergyBall(simData.finalPos, simData.finalNormal)
+			return
+		end
+
+		local floatIdx = 1 + (progress * (#path - 1))
+		local idx1 = math.floor(floatIdx)
+		local idx2 = math.min(idx1 + 1, #path)
+		local frac = floatIdx - idx1
+
+		local curPos = LerpVector(frac, path[idx1], path[idx2])
+		ball:SetPos(curPos)
+
+		local nextIdx = math.min(idx2 + 1, #path)
+		local dir = (path[nextIdx] - path[idx1]):GetNormalized()
+		if not dir:IsZero() then
+			ball:SetAngles(dir:Angle())
+
+			if elapsed > 0.15 and (curPos - startOrigin):LengthSqr() > 62500 then
+				local tr = util.TraceHull({
+					start = curPos,
+					endpos = curPos + (dir * 28),
+					mins = Vector(-6, -6, -6),
+					maxs = Vector(6, 6, 6),
+					mask = MASK_SHOT,
+					filter = { ball, shooter, wep },
+				})
+				if tr.Hit and (tr.HitPos - startOrigin):LengthSqr() > 90000 then
+					hook.Remove("Think", hookName)
+					DetonateEnergyBall(tr.HitPos, tr.HitNormal)
+					return
+				end
+			end
+		end
+	end)
+end
+
+function NAPC.ExecuteContactEnergyBall(npc, enemy, weapon, spawnPos, launchVel, simData)
+	local cur = NAPC.CurTime_Tick or CurTime()
+
+	npc.NextFireContactBall_NAPC = cur + math.Rand(9.0, 16.0)
+	npc.NextFireAR2Ball_NAPC = cur + math.Rand(5.0, 8.0)
+	npc.AltFireEnd_NAPC = cur + 1.1
+
+	npc:SetSaveValue("m_vecAltFireTarget", Vector(0, 0, 0))
+
+	local sqID = NAPC.GetSquadID(npc)
+	if sqID and NAPC.TheaterSquads[sqID] then
+		NAPC.TheaterSquads[sqID].NextSquadGrenadeTime = cur + math.Rand(3.5, 6.0)
+	end
+
+	npc:StopMoving()
+	npc:ClearSchedule()
+	npc:SetSchedule(SCHED_COMBAT_FACE)
+	weapon:SetNextPrimaryFire(cur + 1.3)
+
+	local aimDir = launchVel:GetNormalized()
+	local aimAng = Angle(0, aimDir:Angle().y, 0)
+	npc:SetAngles(aimAng)
+	if npc.SetIdealYaw then
+		npc:SetIdealYaw(aimAng.y)
+	end
+
+	npc:EmitSound("NPC_CombineBall.Launch")
+	weapon:EmitSound("Weapon_IRifle.Single")
+
+	npc:RestartGesture(ACT_GESTURE_RANGE_ATTACK1)
+
+	local effectData = EffectData()
+	effectData:SetOrigin(spawnPos)
+	effectData:SetNormal(aimDir)
+	effectData:SetEntity(weapon)
+	effectData:SetAttachment(weapon:LookupAttachment("muzzle") or 1)
+	effectData:SetScale(1.4)
+	util.Effect("MuzzleEffect", effectData, true, true)
+
+	local ball = ents.Create("prop_physics")
+	if not IsValid(ball) then
+		ball = ents.Create("prop_dynamic_override")
+	end
+
+	if IsValid(ball) then
+		ball:SetModel("models/effects/combineball.mdl")
+		ball:SetPos(spawnPos)
+		ball:SetAngles(aimDir:Angle())
+		ball:SetOwner(npc)
+		ball:Spawn()
+		ball:Activate()
+
+		ball:SetSolid(SOLID_NONE)
+		ball:SetMoveType(MOVETYPE_NONE)
+		ball:SetCollisionGroup(COLLISION_GROUP_DEBRIS)
+
+		local phys = ball:GetPhysicsObject()
+		if IsValid(phys) then
+			phys:EnableMotion(false)
+			phys:EnableGravity(false)
+			phys:EnableCollisions(false)
+		end
+
+		NAPC.AttachContactEnergyBallToPath(ball, simData, npc, weapon)
+	end
+
+	table.insert(NAPC.DebugEnergyBallArcs, {
+		npcIdx = npc:EntIndex(),
+		startPos = spawnPos,
+		finalPos = simData.finalPos,
+		path = simData.path,
+		bounces = {},
+		valid = true,
+		hitEnemy = simData.hitEnemy,
+		expire = cur + 4.5,
+	})
+
+	if #NAPC.DebugEnergyBallArcs > 12 then
+		table.remove(NAPC.DebugEnergyBallArcs, 1)
+	end
+end
+
+function NAPC.TryFireContactEnergyBall(npc, enemy, weapon)
+	if not IsValid(npc) or not IsValid(enemy) or not enemy:Alive() or not IsValid(weapon) then
+		return false
+	end
+	if npc:GetClass() ~= "npc_combine_s" or not npc:GetInternalVariable("m_fIsElite") then
+		return false
+	end
+	if weapon:GetClass() ~= "weapon_ar2" then
+		return false
+	end
+
+	local cur = NAPC.CurTime_Tick or CurTime()
+	if cur < (npc.NextFireContactBall_NAPC or 0) then
+		return false
+	end
+	if npc.AltFireEnd_NAPC and cur < npc.AltFireEnd_NAPC then
+		return false
+	end
+
+	local curSched = npc:GetCurrentSchedule()
+	if NAPC.Tables.BannedSchedule_List1[curSched] or NAPC.Tables.BannedSchedule_List2[curSched] then
+		return false
+	end
+
+	local sqID = NAPC.GetSquadID(npc)
+	if sqID and NAPC.TheaterSquads[sqID] and (NAPC.TheaterSquads[sqID].NextSquadGrenadeTime or 0) > cur then
+		return false
+	end
+
+	local enemyPos = enemy:WorldSpaceCenter()
+	local eyePos = npc:EyePos()
+	local toEnemy = (enemyPos - eyePos):GetNormalized()
+
+	local spawnPos = eyePos + (toEnemy * 44)
+	local trMuzzle = util.TraceLine({
+		start = eyePos,
+		endpos = eyePos + (toEnemy * 48),
+		mask = MASK_SOLID,
+		filter = { npc, weapon },
+	})
+	if trMuzzle.Hit then
+		return false
+	end
+
+	local clusterPos, clusterEnemy, clusterType = NAPC.FindGrenadeTargetDestination(npc, enemy)
+	local targetEnemy = IsValid(clusterEnemy) and clusterEnemy or enemy
+
+	local grav = GetConVar("sv_gravity") and GetConVar("sv_gravity"):GetFloat() or 600
+	local nominalSpeed = 1500
+	local currentEnemyPos = targetEnemy:GetPos()
+
+	local distEst = (currentEnemyPos - spawnPos):Length()
+	local flightTimeEst = math.Clamp(distEst / nominalSpeed, 0.35, 2.5)
+	local targetPos = nil
+
+	for iter = 1, 2 do
+		local predicted = NAPC.PredictEnemyTargetPosition(targetEnemy, flightTimeEst, spawnPos)
+		if clusterPos and clusterType == "group" then
+			local displacement = predicted - currentEnemyPos
+			targetPos = clusterPos + displacement
+		elseif clusterPos and clusterType == "cover" and not targetEnemy:Visible(npc) then
+			local vel = targetEnemy:GetVelocity()
+			if vel:Length2DSqr() > 900 then
+				local displacement = predicted - currentEnemyPos
+				targetPos = clusterPos + displacement
+			else
+				targetPos = clusterPos
+			end
+		else
+			targetPos = predicted
+		end
+
+		local trGround = util.TraceLine({
+			start = targetPos + Vector(0, 0, 36),
+			endpos = targetPos - Vector(0, 0, 96),
+			mask = MASK_SOLID_BRUSHONLY,
+		})
+		if trGround.Hit and not trGround.StartSolid and trGround.HitNormal.z > 0.65 then
+			targetPos = trGround.HitPos + Vector(0, 0, 10)
+		end
+
+		local newDist = (targetPos - spawnPos):Length()
+		flightTimeEst = math.Clamp(newDist / nominalSpeed, 0.35, 2.5)
+	end
+
+	local toTarget = targetPos - spawnPos
+	local dist = toTarget:Length()
+	if dist < 400 or dist > 3800 then
+		return false
+	end
+
+	if not NAPC.IsGrenadeBlastSafe(npc, targetPos, 220) then
+		return false
+	end
+
+	local candidateTimeTiers = { flightTimeEst, flightTimeEst * 0.85, flightTimeEst * 1.15 }
+	local bestLaunchVel, bestSimData = nil, nil
+
+	for _, testFlightTime in ipairs(candidateTimeTiers) do
+		testFlightTime = math.Clamp(testFlightTime, 0.3, 2.8)
+		local launchVel = NAPC.CalculateBallisticVelocity(spawnPos, targetPos, testFlightTime, grav)
+
+		local isValid, simFinalPos, simFinalNormal, simPath, hitEnemy, totalSimTime =
+			NAPC.SimulateContactBallTrajectory(npc, spawnPos, launchVel, testFlightTime + 0.5, targetEnemy, 0.04)
+
+		local reachedTarget = hitEnemy or ((simFinalPos - targetPos):LengthSqr() <= 62500)
+		if isValid and reachedTarget then
+			bestLaunchVel = launchVel
+			bestSimData = {
+				path = simPath,
+				finalPos = simFinalPos,
+				finalNormal = simFinalNormal,
+				duration = totalSimTime,
+				hitEnemy = hitEnemy,
+				dt = 0.04,
+			}
+			break
+		end
+	end
+
+	if not bestLaunchVel or not bestSimData then
+		npc.NextFireContactBall_NAPC = cur + math.Rand(2.0, 3.5)
+		return false
+	end
+
+	NAPC.ExecuteContactEnergyBall(npc, targetEnemy, weapon, spawnPos, bestLaunchVel, bestSimData)
+	return true
+end
+
+function NAPC.Bullet_FireContactEnergyBall(npc, enemypos, weapon, data)
+	if npc:GetClass() ~= "npc_combine_s" or not npc:GetInternalVariable("m_fIsElite") then
+		return false
+	end
+	if weapon:GetClass() ~= "weapon_ar2" then
+		return false
+	end
+
+	local cur = NAPC.CurTime_Tick or CurTime()
+	if cur < (npc.NextFireContactBall_NAPC or 0) then
+		return false
+	end
+
+	local enemy = npc:GetEnemy()
+	if not IsValid(enemy) or not enemy:Alive() then
+		return false
+	end
+
+	local enemyDistSqr = (enemy:GetPos() - npc:GetPos()):LengthSqr()
+	if enemyDistSqr < 160000 or enemyDistSqr > 14440000 then
+		return false
+	end
+
+	if math.random(1, 16) ~= 8 then
+		return false
+	end
+
+	if NAPC.TryFireContactEnergyBall(npc, enemy, weapon) then
+		data.Damage = 0
+		data.Num = 0
+		return true
+	end
+
+	return false
+end
+
 function NAPC.Tick_AdvancedBehaviours(npc, NPCClass)
 	if not npc.Initialized_NAPC then
 		return
@@ -11609,9 +12388,15 @@ function NAPC.Tick_AdvancedBehaviours(npc, NPCClass)
 		end
 	end
 
-	if NPCClass == "npc_combine_s" and IsValid(enemy) and weapon:GetClass() == "weapon_ar2" then
-		local isElite = npc:GetInternalVariable("m_fIsElite")
-		if isElite then
+	local isAR2 = weapon:GetClass() == "weapon_ar2"
+	local isCombineOrMetro = (NPCClass == "npc_combine_s" or NPCClass == "npc_metropolice")
+
+	if isCombineOrMetro and IsValid(enemy) and isAR2 then
+		local isElite = (NPCClass == "npc_combine_s") and npc:GetInternalVariable("m_fIsElite")
+		local canAltFire = NAPC.ConvarsBool["NAPC_NPCs_AR2_AltFire"]
+			or (NAPC.ConvarsBool["NAPC_Combine_AR2_AltFire"] and isCombineOrMetro)
+
+		if canAltFire then
 			local muzzlePos = npc:EyePos() + (npc:GetForward() * 20)
 			local hasClearance = NAPC.CheckAR2BallClearance(npc, muzzlePos, enemy)
 			local nextAlt = npc:GetInternalVariable("m_flNextAltFireTime") or 0
@@ -11663,7 +12448,7 @@ function NAPC.Tick_AdvancedBehaviours(npc, NPCClass)
 				end
 			elseif
 				not hasClearance
-				and nextAlt <= CurTime()
+				and (nextAlt <= CurTime() or not isElite)
 				and (npc.NextFireAR2Ball_NAPC or 0) <= NAPC.CurTime_Tick
 			then
 				local bouncePos, aimDir, simData =
@@ -11673,7 +12458,15 @@ function NAPC.Tick_AdvancedBehaviours(npc, NPCClass)
 				else
 					npc:SetSaveValue("m_flNextAltFireTime", CurTime() + math.Rand(3.5, 5.5))
 					npc:SetSaveValue("m_vecAltFireTarget", Vector(0, 0, 0))
+					npc.NextFireAR2Ball_NAPC = NAPC.CurTime_Tick + math.Rand(3.5, 5.5)
 				end
+			end
+		end
+
+		if isElite and (npc.NextFireContactBall_NAPC or 0) <= NAPC.CurTime_Tick then
+			local dSqr = (enemy:GetPos() - npc:GetPos()):LengthSqr()
+			if dSqr >= 160000 and math.random(1, 25) == 12 then
+				NAPC.TryFireContactEnergyBall(npc, enemy, weapon)
 			end
 		end
 	end
@@ -12694,8 +13487,15 @@ function NAPC.EntityFireBullets(npc, data)
 				if NAPC.Tables.NPCClass_Main[NPCClass] or NAPC.Tables.NPCClass_KeyNPCs[NPCClass] then
 					if data.Num < 2 then
 						npc.IsShotgunner_NAPC = false
-						NAPC.Bullet_FireAR2Ball(npc, enemypos, weapon, data)
-						NAPC.Bullet_FireSMGGrenade(npc, enemypos, weapon, data)
+
+						local altFired = NAPC.Bullet_FireAR2Ball(npc, enemypos, weapon, data)
+						if not altFired then
+							altFired = NAPC.Bullet_FireContactEnergyBall(npc, enemypos, weapon, data)
+						end
+						if not altFired then
+							NAPC.Bullet_FireSMGGrenade(npc, enemypos, weapon, data)
+						end
+
 						NAPC.Bullet_PerfectAccuracy(npc, NPCClass, enemy, enemypos, enemyhead, data)
 						NAPC.Bullet_AimForHead(npc, enemy, enemypos, enemyhead, weapon, data)
 						NAPC.AimForExplosive(false, npc, nil, data)

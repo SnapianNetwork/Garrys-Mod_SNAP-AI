@@ -37,6 +37,8 @@ local function NAPC_Panel_1(panel)
 	panel:ControlHelp(NAPC_Text["NAPC_Debug_AreaScores"].help_2)
 	panel:CheckBox(NAPC_Text["NAPC_Debug_ShowWindows"].OptionName, "NAPC_Debug_ShowWindows")
 	panel:ControlHelp(NAPC_Text["NAPC_Debug_ShowWindows"].help_1)
+	panel:CheckBox(NAPC_Text["NAPC_Debug_ShowPriorityTargets"].OptionName, "NAPC_Debug_ShowPriorityTargets")
+	panel:ControlHelp(NAPC_Text["NAPC_Debug_ShowPriorityTargets"].help_1)
 	panel:Help([[ ]])
 	panel:Button(NAPC_Text["NAPC_Generate_Windows"].OptionName, "napc_generate_windows")
 	panel:ControlHelp(NAPC_Text["NAPC_Generate_Windows"].help_1)
@@ -313,6 +315,76 @@ net.Receive("NAPC_DebugData", function()
 	end
 end)
 
+local function IsAreaVisibleFromEye(pos, eyePos, localPly, corners)
+	local targetPos = pos + Vector(0, 0, 16)
+	local tr = util.TraceLine({
+		start = eyePos,
+		endpos = targetPos,
+		mask = MASK_OPAQUE,
+		filter = localPly,
+	})
+
+	if not tr.Hit or tr.Fraction >= 0.95 or (tr.HitPos - targetPos):LengthSqr() <= 1024 then
+		return true
+	end
+
+	if corners and #corners > 0 then
+		for i = 1, math.min(#corners, 4) do
+			local cPos = corners[i]
+			if isvector(cPos) then
+				local cTarget = cPos + Vector(0, 0, 14)
+				local trC = util.TraceLine({
+					start = eyePos,
+					endpos = cTarget,
+					mask = MASK_OPAQUE,
+					filter = localPly,
+				})
+				if not trC.Hit or trC.Fraction >= 0.95 or (trC.HitPos - cTarget):LengthSqr() <= 1024 then
+					return true
+				end
+			end
+		end
+	end
+
+	return false
+end
+
+local function IsNPCVisibleFromEye(npc, eyePos, localPly)
+	if not npc or not npc.pos then
+		return false
+	end
+
+	local ent = Entity(npc.entIdx)
+	local filter = localPly
+
+	local testPoints = {
+		npc.eyePos or (npc.pos + Vector(0, 0, 64)),
+		npc.pos + Vector(0, 0, 38),
+		npc.pos + Vector(0, 0, 16),
+	}
+
+	for i = 1, #testPoints do
+		local pt = testPoints[i]
+		local tr = util.TraceLine({
+			start = eyePos,
+			endpos = pt,
+			mask = MASK_OPAQUE,
+			filter = filter,
+		})
+
+		if
+			not tr.Hit
+			or (IsValid(ent) and tr.Entity == ent)
+			or tr.Fraction >= 0.95
+			or (tr.HitPos - pt):LengthSqr() <= 1024
+		then
+			return true
+		end
+	end
+
+	return false
+end
+
 local function DrawNAPC_OverheadDebug()
 	if not DebugPayload or CurTime() - LastDebugReceived > 2.0 then
 		return
@@ -320,6 +392,8 @@ local function DrawNAPC_OverheadDebug()
 
 	local localPly = LocalPlayer()
 	local eyePos = localPly:EyePos()
+	local showPriority = GetConVar("NAPC_Debug_ShowPriorityTargets")
+		and GetConVar("NAPC_Debug_ShowPriorityTargets"):GetBool()
 
 	for _, npc in ipairs(DebugPayload.npcs or {}) do
 		local npcWorldPos = npc.pos + Vector(0, 0, 80)
@@ -327,14 +401,14 @@ local function DrawNAPC_OverheadDebug()
 
 		if dist <= 2500 then
 			local screenData = npcWorldPos:ToScreen()
-			if screenData.visible then
+			if screenData.visible and IsNPCVisibleFromEye(npc, eyePos, localPly) then
 				local x = screenData.x
 				local y = screenData.y
 
 				local hasTopScores = npc.ooda and npc.ooda.topScores and #npc.ooda.topScores > 0
 				local boxWidth = 230
 				local boxHeight = 110
-				if npc.priorityTargetIdx then
+				if showPriority and npc.priorityTargetIdx then
 					boxHeight = boxHeight + 14
 				end
 				if hasTopScores then
@@ -442,7 +516,7 @@ local function DrawNAPC_OverheadDebug()
 				draw.SimpleText(enemyTxt, "NAPC_Debug_Small", drawX + 6, drawY + 74, enemyCol, TEXT_ALIGN_LEFT)
 
 				local currentY = drawY + 88
-				if npc.priorityTargetIdx then
+				if showPriority and npc.priorityTargetIdx then
 					draw.SimpleText(
 						string.format("★ FOCUS: [%d] (%s)", npc.priorityTargetIdx, npc.priorityReason or "PRIORITY"),
 						"NAPC_Debug_Small",
@@ -506,7 +580,7 @@ local function DrawNAPC_AreaScoresDebug()
 	for _, area in ipairs(DebugPayload.areaScores) do
 		if area and area.pos and isvector(area.pos) then
 			local dist = eyePos:Distance(area.pos)
-			if dist <= 2400 then
+			if dist <= 2400 and IsAreaVisibleFromEye(area.pos, eyePos, localPly, area.corners) then
 				local screen = (area.pos + Vector(0, 0, 14)):ToScreen()
 				if screen.visible then
 					local distToCrosshair = math.sqrt((screen.x - cx) ^ 2 + (screen.y - cy) ^ 2)
@@ -637,9 +711,11 @@ local function DrawNAPC_HUDDashboard()
 		squadCount = squadCount + 1
 	end
 
+	local showPriority = GetConVar("NAPC_Debug_ShowPriorityTargets")
+		and GetConVar("NAPC_Debug_ShowPriorityTargets"):GetBool()
 	local dangerCount = #(DebugPayload.dangerZones or {})
 	local areaCount = #(DebugPayload.areaScores or {})
-	local priorityCount = #(DebugPayload.priorityTargets or {})
+	local priorityCount = showPriority and #(DebugPayload.priorityTargets or {}) or 0
 
 	local dynamicH = 85
 		+ (squadCount * 36)
@@ -904,8 +980,15 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 
 	local showAreaScores = GetConVar("NAPC_Debug_AreaScores") and GetConVar("NAPC_Debug_AreaScores"):GetBool()
 	if showAreaScores then
+		local localPly = LocalPlayer()
+		local eyePos = IsValid(localPly) and localPly:EyePos() or nil
+
 		for _, area in ipairs(DebugPayload.areaScores or {}) do
 			if area and area.pos and isvector(area.pos) then
+				if eyePos and not IsAreaVisibleFromEye(area.pos, eyePos, localPly, area.corners) then
+					continue
+				end
+
 				local col = Color(100, 255, 100, 140)
 				if area.danger >= 4 then
 					col = Color(255, 50, 50, 200)
@@ -967,18 +1050,22 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 		end
 	end
 
-	for _, pt in ipairs(DebugPayload.priorityTargets or {}) do
-		if pt and pt.wsc and isvector(pt.wsc) then
-			local pulse = math.abs(math.sin(CurTime() * 3.5)) * 6
-			render.DrawWireframeSphere(pt.wsc, 18 + pulse, 10, 10, Color(255, 215, 0, 240), false)
-			render.DrawWireframeBox(
-				pt.wsc,
-				Angle(0, CurTime() * 45, 0),
-				Vector(-12, -12, -12),
-				Vector(12, 12, 12),
-				Color(255, 180, 0, 220),
-				false
-			)
+	local showPriorityTargets = GetConVar("NAPC_Debug_ShowPriorityTargets")
+		and GetConVar("NAPC_Debug_ShowPriorityTargets"):GetBool()
+	if showPriorityTargets then
+		for _, pt in ipairs(DebugPayload.priorityTargets or {}) do
+			if pt and pt.wsc and isvector(pt.wsc) then
+				local pulse = math.abs(math.sin(CurTime() * 3.5)) * 6
+				render.DrawWireframeSphere(pt.wsc, 18 + pulse, 10, 10, Color(255, 215, 0, 240), false)
+				render.DrawWireframeBox(
+					pt.wsc,
+					Angle(0, CurTime() * 45, 0),
+					Vector(-12, -12, -12),
+					Vector(12, 12, 12),
+					Color(255, 180, 0, 220),
+					false
+				)
+			end
 		end
 	end
 
@@ -1015,7 +1102,7 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 
 	for _, npc in ipairs(DebugPayload.npcs or {}) do
 		if npc and npc.pos and isvector(npc.pos) then
-			if npc.priorityTargetIdx then
+			if showPriorityTargets and npc.priorityTargetIdx then
 				for _, pt in ipairs(DebugPayload.priorityTargets or {}) do
 					if pt.entIdx == npc.priorityTargetIdx and pt.wsc then
 						render.DrawLine(

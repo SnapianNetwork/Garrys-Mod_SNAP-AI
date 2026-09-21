@@ -310,4 +310,8 @@ NAPC_Localization_CN = {
 		OptionName = "启用联合军频繁投掷手雷",
 		help_1 = "让联合军士兵在战斗中更多地使用手雷。",
 	},
+	["NAPC_Debug_ShowPriorityTargets"] = {
+		OptionName = "显示优先集火目标",
+		help_1 = "切换显示优先目标高亮标记、HUD集火列表以及小队集火指示线的调试可视化。",
+	}
 }

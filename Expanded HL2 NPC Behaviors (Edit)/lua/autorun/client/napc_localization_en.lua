@@ -309,5 +309,9 @@ NAPC_Localization_EN = {
 		OptionName = "Enable Metropolice Draw Pistol",
 		help_1 = "Allows stunstick-wielding Metropolice to discard their stunstick and draw a pistol when facing armed ranged enemies.",
 		help_2 = "They will drop the stunstick as a physics entity and draw their sidearm.",
+	},
+	["NAPC_Debug_ShowPriorityTargets"] = {
+		OptionName = "Show Priority Targets",
+		help_1 = "Toggles 2D and 3D debug visualization for priority targets and squad focus fire vectors.",
 	}
 }
