@@ -316,32 +316,38 @@ net.Receive("NAPC_DebugData", function()
 end)
 
 local function IsAreaVisibleFromEye(pos, eyePos, localPly, corners)
-	local targetPos = pos + Vector(0, 0, 16)
-	local tr = util.TraceLine({
-		start = eyePos,
-		endpos = targetPos,
-		mask = MASK_OPAQUE,
-		filter = localPly,
-	})
+	if not isvector(pos) or not isvector(eyePos) then
+		return false
+	end
 
-	if not tr.Hit or tr.Fraction >= 0.95 or (tr.HitPos - targetPos):LengthSqr() <= 1024 then
+	local function CheckPointVisible(target)
+		local tr = util.TraceLine({
+			start = eyePos,
+			endpos = target,
+			mask = MASK_OPAQUE,
+			filter = localPly,
+		})
+
+		if not tr.Hit then
+			return true
+		end
+
+		if tr.HitNormal.z > 0.65 and (tr.HitPos - target):LengthSqr() <= 144 then
+			return true
+		end
+
+		return false
+	end
+
+	if CheckPointVisible(pos + Vector(0, 0, 14)) then
 		return true
 	end
 
 	if corners and #corners > 0 then
 		for i = 1, math.min(#corners, 4) do
 			local cPos = corners[i]
-			if isvector(cPos) then
-				local cTarget = cPos + Vector(0, 0, 14)
-				local trC = util.TraceLine({
-					start = eyePos,
-					endpos = cTarget,
-					mask = MASK_OPAQUE,
-					filter = localPly,
-				})
-				if not trC.Hit or trC.Fraction >= 0.95 or (trC.HitPos - cTarget):LengthSqr() <= 1024 then
-					return true
-				end
+			if isvector(cPos) and CheckPointVisible(cPos + Vector(0, 0, 14)) then
+				return true
 			end
 		end
 	end
@@ -585,108 +591,166 @@ local function DrawNAPC_AreaScoresDebug()
 				if screen.visible then
 					local distToCrosshair = math.sqrt((screen.x - cx) ^ 2 + (screen.y - cy) ^ 2)
 					local isHovered = distToCrosshair < 70 and dist <= 1600
-					local danger = area.danger or 0
-					local flank = area.flank or 0
-					local overlook = area.overlook or 0
 
-					local hasSignificance = danger >= 0.8 or flank >= 0.35 or overlook >= 0.35
-					if isHovered or hasSignificance then
-						local col = Color(100, 255, 120)
-						if danger >= 4 then
-							col = Color(255, 60, 60)
-						elseif danger >= 2 then
-							col = Color(255, 160, 40)
-						elseif danger >= 0.8 then
-							col = Color(255, 230, 80)
-						elseif flank >= 0.4 then
-							col = Color(255, 185, 30)
-						elseif overlook >= 0.4 then
-							col = Color(0, 215, 255)
+					local factions = area.factions
+						or {
+							[area.primaryFaction or "combine"] = {
+								danger = area.danger or 0,
+								flank = area.flank or 0,
+								overlook = area.overlook or 0,
+								deaths = area.deaths or 0,
+								fired = area.fired or 0,
+								seen = area.seen or 0,
+							},
+						}
+
+					local hasSignificance = isHovered
+					if not hasSignificance then
+						for _, fData in pairs(factions) do
+							if
+								(fData.danger or 0) >= 0.8
+								or (fData.flank or 0) >= 0.35
+								or (fData.overlook or 0) >= 0.35
+							then
+								hasSignificance = true
+								break
+							end
 						end
+					end
 
+					if hasSignificance then
 						if isHovered then
-							local cardW = 190
-							local cardH = 46
+							local cardW = 270
+							local activeFactions = { "combine", "resistance" }
+							local cardH = 24 + (#activeFactions * 26)
 							local cardX = screen.x - (cardW * 0.5)
-							local cardY = screen.y - cardH - 8
+							local cardY = screen.y - cardH - 10
 
-							surface.SetDrawColor(10, 14, 20, 230)
+							surface.SetDrawColor(10, 14, 20, 235)
 							surface.DrawRect(cardX, cardY, cardW, cardH)
-							surface.SetDrawColor(col.r, col.g, col.b, 255)
+							surface.SetDrawColor(0, 180, 255, 255)
 							surface.DrawOutlinedRect(cardX, cardY, cardW, cardH, 1)
 
 							draw.SimpleText(
-								string.format("NavArea #%d [%s]", area.id, area.faction or "combine"),
+								string.format("NavArea #%d (Factions)", area.id),
 								"NAPC_Debug_Text",
 								cardX + 6,
-								cardY + 3,
+								cardY + 4,
 								Color(255, 255, 255),
 								TEXT_ALIGN_LEFT
 							)
-							draw.SimpleText(
-								string.format("Danger: %.1f", danger),
-								"NAPC_Debug_Text",
-								cardX + cardW - 6,
-								cardY + 3,
-								col,
-								TEXT_ALIGN_RIGHT
-							)
-							draw.SimpleText(
-								string.format(
-									"Deaths: %.1f | Fire: %.1f | Watch: %.1f",
-									area.deaths or 0,
-									area.fired or 0,
-									area.seen or 0
-								),
-								"NAPC_Debug_Small",
-								cardX + 6,
-								cardY + 18,
-								Color(200, 200, 200),
-								TEXT_ALIGN_LEFT
-							)
-							draw.SimpleText(
-								string.format("Flank: %.2f | Ridge: %.2f", flank, overlook),
-								"NAPC_Debug_Small",
-								cardX + 6,
-								cardY + 30,
-								(flank > 0.35 or overlook > 0.35) and Color(255, 215, 100) or Color(160, 160, 160),
-								TEXT_ALIGN_LEFT
-							)
-						else
-							local badgeTxt = ""
-							if danger >= 2.0 then
-								badgeTxt = string.format("⚠ DANGER %.1f", danger)
-							elseif flank >= 0.4 then
-								badgeTxt = string.format("⇗ FLANK %.2f", flank)
-							elseif overlook >= 0.4 then
-								badgeTxt = string.format("▲ RIDGE %.2f", overlook)
-							elseif danger >= 0.8 then
-								badgeTxt = string.format("⚠ %.1f", danger)
-							end
 
-							if badgeTxt ~= "" then
-								surface.SetFont("NAPC_Debug_Small")
-								local tw, th = surface.GetTextSize(badgeTxt)
-								local padX, padY = 5, 2
-								local bgW = tw + (padX * 2)
-								local bgH = th + (padY * 2)
-								local bgX = screen.x - (bgW * 0.5)
-								local bgY = screen.y - (bgH * 0.5)
-
-								surface.SetDrawColor(12, 16, 22, 215)
-								surface.DrawRect(bgX, bgY, bgW, bgH)
-								surface.SetDrawColor(col.r, col.g, col.b, 200)
-								surface.DrawOutlinedRect(bgX, bgY, bgW, bgH, 1)
+							local rowY = cardY + 22
+							for _, fName in ipairs(activeFactions) do
+								local fData = factions[fName]
+									or { danger = 0, flank = 0, overlook = 0, deaths = 0, fired = 0, seen = 0 }
+								local fCol = (fName == "combine") and Color(0, 200, 255) or Color(255, 175, 40)
+								local fLabel = (fName == "combine") and "CMB" or "RES"
 
 								draw.SimpleText(
-									badgeTxt,
+									string.format("[%s]", fLabel),
 									"NAPC_Debug_Small",
-									screen.x,
-									screen.y,
-									col,
-									TEXT_ALIGN_CENTER,
-									TEXT_ALIGN_CENTER
+									cardX + 6,
+									rowY,
+									fCol,
+									TEXT_ALIGN_LEFT
 								)
+								draw.SimpleText(
+									string.format("D: %.1f", fData.danger or 0),
+									"NAPC_Debug_Small",
+									cardX + 44,
+									rowY,
+									((fData.danger or 0) >= 2) and Color(255, 80, 80) or Color(220, 220, 220),
+									TEXT_ALIGN_LEFT
+								)
+								draw.SimpleText(
+									string.format("F: %.2f", fData.flank or 0),
+									"NAPC_Debug_Small",
+									cardX + 96,
+									rowY,
+									((fData.flank or 0) >= 0.35) and Color(255, 215, 80) or Color(160, 160, 160),
+									TEXT_ALIGN_LEFT
+								)
+								draw.SimpleText(
+									string.format("R: %.2f", fData.overlook or 0),
+									"NAPC_Debug_Small",
+									cardX + 150,
+									rowY,
+									((fData.overlook or 0) >= 0.35) and Color(0, 230, 255) or Color(160, 160, 160),
+									TEXT_ALIGN_LEFT
+								)
+								draw.SimpleText(
+									string.format(
+										"(☠%d 💥%d 👁%d)",
+										math.floor(fData.deaths or 0),
+										math.floor(fData.fired or 0),
+										math.floor(fData.seen or 0)
+									),
+									"NAPC_Debug_Small",
+									cardX + cardW - 6,
+									rowY,
+									Color(160, 160, 160),
+									TEXT_ALIGN_RIGHT
+								)
+
+								rowY = rowY + 24
+							end
+						else
+							local badgeLines = {}
+							for _, fName in ipairs({ "combine", "resistance" }) do
+								local fData = factions[fName]
+								if fData then
+									local d = fData.danger or 0
+									local f = fData.flank or 0
+									local r = fData.overlook or 0
+									if d >= 0.8 or f >= 0.35 or r >= 0.35 then
+										local tag = (fName == "combine") and "CMB" or "RES"
+										local txt = string.format("%s: D:%.1f", tag, d)
+										if f >= 0.35 then
+											txt = txt .. string.format(" F:%.2f", f)
+										end
+										if r >= 0.35 then
+											txt = txt .. string.format(" R:%.2f", r)
+										end
+										badgeLines[#badgeLines + 1] = {
+											text = txt,
+											col = (fName == "combine") and Color(0, 200, 255) or Color(255, 175, 40),
+										}
+									end
+								end
+							end
+
+							if #badgeLines > 0 then
+								local lineH = 14
+								local totalH = #badgeLines * lineH + 4
+								local startY = screen.y - (totalH * 0.5)
+
+								surface.SetFont("NAPC_Debug_Small")
+								local maxW = 0
+								for _, lineData in ipairs(badgeLines) do
+									local tw = surface.GetTextSize(lineData.text)
+									if tw > maxW then
+										maxW = tw
+									end
+								end
+								local totalW = maxW + 12
+
+								surface.SetDrawColor(12, 16, 22, 220)
+								surface.DrawRect(screen.x - (totalW * 0.5), startY, totalW, totalH)
+								surface.SetDrawColor(255, 255, 255, 80)
+								surface.DrawOutlinedRect(screen.x - (totalW * 0.5), startY, totalW, totalH, 1)
+
+								for idx, lineData in ipairs(badgeLines) do
+									draw.SimpleText(
+										lineData.text,
+										"NAPC_Debug_Small",
+										screen.x,
+										startY + 2 + ((idx - 1) * lineH),
+										lineData.col,
+										TEXT_ALIGN_CENTER,
+										TEXT_ALIGN_TOP
+									)
+								end
 							end
 						end
 					end
@@ -989,12 +1053,28 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 					continue
 				end
 
+				local factions = area.factions
+					or {
+						[area.primaryFaction or "combine"] = {
+							danger = area.danger or 0,
+							flank = area.flank or 0,
+							overlook = area.overlook or 0,
+						},
+					}
+
+				local worstDanger = area.danger or 0
+				for _, fData in pairs(factions) do
+					if (fData.danger or 0) > worstDanger then
+						worstDanger = fData.danger
+					end
+				end
+
 				local col = Color(100, 255, 100, 140)
-				if area.danger >= 4 then
+				if worstDanger >= 4 then
 					col = Color(255, 50, 50, 200)
-				elseif area.danger >= 2 then
+				elseif worstDanger >= 2 then
 					col = Color(255, 160, 40, 180)
-				elseif area.danger >= 0.8 then
+				elseif worstDanger >= 0.8 then
 					col = Color(255, 230, 80, 160)
 				end
 
@@ -1013,19 +1093,24 @@ hook.Add("PostDrawTranslucentRenderables", "NAPC_Debug3D_Render", function()
 					render.DrawLine(corners[4], corners[1], col, false)
 				end
 
-				if (area.flank or 0) > 0.4 then
-					render.DrawWireframeSphere(area.pos + Vector(0, 0, 14), 10, 6, 6, Color(255, 185, 30, 200), false)
-				end
+				for fName, fData in pairs(factions) do
+					local fCol = (fName == "combine") and Color(0, 210, 255, 200) or Color(255, 175, 40, 200)
+					local fOffset = (fName == "combine") and Vector(-4, 0, 14) or Vector(4, 0, 14)
 
-				if (area.overlook or 0) > 0.4 then
-					render.DrawWireframeBox(
-						area.pos + Vector(0, 0, 14),
-						Angle(0, 0, 0),
-						Vector(-6, -6, 0),
-						Vector(6, 6, 16),
-						Color(0, 215, 255, 200),
-						false
-					)
+					if (fData.flank or 0) > 0.35 then
+						render.DrawWireframeSphere(area.pos + fOffset, 8, 6, 6, fCol, false)
+					end
+
+					if (fData.overlook or 0) > 0.35 then
+						render.DrawWireframeBox(
+							area.pos + fOffset,
+							Angle(0, 0, 0),
+							Vector(-5, -5, 0),
+							Vector(5, 5, 14),
+							fCol,
+							false
+						)
+					end
 				end
 			end
 		end
